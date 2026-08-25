@@ -47,7 +47,7 @@ class TrainConfig:
 
     # --- 渐进退化 ---
     progressive_steps: int = 12
-    progressive_lift: str = "normalized_adjoint"
+    progressive_lift: str = "auto"       # auto -> physical: normalized_adjoint, ordinary: bilinear
     boundary_probability: float = 0.2
     boundary_radius: int = 1
 
@@ -112,6 +112,16 @@ def get_dataset_configs():
             n_select_bands=8,
         ),
     }
+
+
+def resolve_config_defaults(cfg: TrainConfig):
+    """Resolve defaults that depend on another option without hiding explicit errors."""
+    if cfg.progressive_lift == "auto":
+        cfg.progressive_lift = (
+            "normalized_adjoint"
+            if cfg.degradation_mode == "physical"
+            else "bilinear"
+        )
 
 
 def validate_config(cfg: TrainConfig):
@@ -182,8 +192,8 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument(
         "--progressive_lift",
         type=str,
-        default="normalized_adjoint",
-        choices=["bilinear", "nearest", "adjoint", "normalized_adjoint"],
+        default="auto",
+        choices=["auto", "bilinear", "nearest", "adjoint", "normalized_adjoint"],
     )
     parser.add_argument("--boundary_probability", type=float, default=0.2)
     parser.add_argument("--boundary_radius", type=int, default=1)
@@ -246,6 +256,7 @@ def parse_args(argv: Optional[List[str]] = None):
     if dataset_cfg is not None:
         cfg.n_select_bands = args.n_select_bands or dataset_cfg.n_select_bands
 
+    resolve_config_defaults(cfg)
     validate_config(cfg)
     make_dirs(cfg)
     return cfg

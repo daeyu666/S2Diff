@@ -1,13 +1,13 @@
-"""
-HSI Super-Resolution 项目模板入口。
+"""HSI Super-Resolution project entrypoint.
 
-本文件展示如何使用模板中的 dataloader、losses、metrics、utils 等工具。
-用户需要根据具体项目实现自己的模型、训练逻辑和阶段控制。
+The current branch provides data/SRF utilities plus switchable LR-HSI degradation
+and progressive sensor-degradation states. The neural model and training loop are
+intentionally not implemented yet.
 """
 
 from config import parse_args, print_config
 from data_loader import build_loaders
-from utils import set_seed, get_device
+from utils import get_device, set_seed
 
 
 def main():
@@ -15,38 +15,37 @@ def main():
     print_config(cfg)
     set_seed(cfg.seed)
 
-    # ---- 1. 构建数据加载器 ----
     train_loader, test_loader, info = build_loaders(cfg)
 
-    print(f"\nDataset info:")
-    for k, v in info.items():
-        if k not in ("srf_weights", "hsi_wavelengths"):
-            print(f"  {k}: {v}")
+    hidden = {
+        "srf_weights",
+        "hsi_wavelengths",
+        "degradation_operator",
+        "progressive_degradation",
+    }
+    print("\nDataset / degradation info:")
+    for key, value in info.items():
+        if key not in hidden:
+            print(f"  {key}: {value}")
+
+    degradation = info["degradation_operator"]
+    trajectory = info["progressive_degradation"]
+    print(f"  degradation_operator: {degradation}")
+    print(
+        "  progressive_schedule: "
+        f"T={trajectory.total_steps}, stages={trajectory.stages}, "
+        f"lift={trajectory.default_lift_mode}"
+    )
 
     device = get_device(cfg.device)
+    print(f"  device: {device}")
 
-    # ---- 2. 模型构建（用户自行实现） ----
-    # from your_model import YourModel
-    # model = YourModel(
-    #     n_bands=info["n_bands"],
-    #     n_select_bands=info["n_select_bands"],
-    #     scale_ratio=cfg.scale_ratio,
-    # ).to(device)
-
-    # ---- 3. 损失函数（按需选用模板中的 loss） ----
-    # from losses import SAMLoss, SpectralGradientLoss, DataConsistencyLoss
-    # criterion = ...
-
-    # ---- 4. 训练 / 测试循环（用户自行实现） ----
-    # for epoch in range(cfg.epochs):
-    #     train_one_epoch(...)
-    #     evaluate(...)
-
-    # ---- 5. 保存 checkpoint ----
-    # from utils import save_checkpoint
-    # save_checkpoint(model, optimizer, epoch, best_metric, path)
-
-    print("\nTemplate setup complete. Implement your model and training loop above.")
+    # Neural model/training will be connected only after degradation trajectory
+    # sanity checks pass on real HSI data.
+    print(
+        "\nDegradation/data pipeline setup complete. "
+        "Run check_degradation_trajectory.py before adding the diffusion model."
+    )
 
 
 if __name__ == "__main__":

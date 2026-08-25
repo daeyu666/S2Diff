@@ -1,66 +1,174 @@
-# HSI Super-Resolution 项目模板
+# S2Diff: HSI Super-Resolution Experimental Scaffold
 
-高光谱图像超分辨率（HSI-MSI Fusion）项目的通用代码模板。
+当前仓库用于 HSI-MSI Fusion 超分实验。基础代码提供数据读取、SRF、指标、可切换 LR-HSI 退化和渐进物理退化轨迹；具体扩散网络尚未接入。
 
-提供可直接复用的 dataloader、损失函数、评估指标、SRF 工具和通用训练辅助函数，
-不依赖任何具体的模型结构。
+## 当前代码
 
-## 模板内容
+| 文件/目录 | 说明 |
+|---|---|
+| `data_loader.py` | HSI 读取、patch 构建、LR-HSI 退化、HR-MSI 构建、DataLoader |
+| `degradations/` | Bicubic、Gaussian+Bicubic、Physical 退化及 progressive trajectory |
+| `check_degradation_trajectory.py` | 在接网络前检查各时间步退化状态 |
+| `losses.py` | 当前已实现 SAMLoss；其他一致性损失将在模型阶段补充 |
+| `metrics.py` | PSNR / RMSE / SAM / ERGAS / SSIM / CC |
+| `srf_utils.py` | SRF 加载、插值、离散积分权重、HSI→MSI |
+| `config.py` | 数据、退化和训练通用配置 |
+| `main.py` | 检查数据与退化配置是否正确串联 |
 
-| 文件 | 说明 |
-|------|------|
-| `data_loader.py` | HSI 数据读取（.mat / h5）、预处理、patch 构建、DataLoader |
-| `losses.py` | 光谱重建损失：SAM、光谱梯度、数据一致性、VQ commitment 等 |
-| `metrics.py` | PSNR / RMSE / SAM / ERGAS / SSIM / CC 评估指标 |
-| `srf_utils.py` | 光谱响应函数（SRF）加载、插值、权重构建、HSI→MSI 转换 |
-| `prepare_srf_weights.py` | 预计算并保存 SRF 权重矩阵 |
-| `utils.py` | 通用工具：随机种子、设备选择、checkpoint 存取、日志、CSV logger |
-| `config.py` | 训练配置 dataclass + 命令行解析（不含模型参数） |
-| `main.py` | 模板入口示例，展示如何串联各组件 |
-| `analyze_spectral_regions.py` | 按光谱区域分析模型重建质量（模型通过参数传入） |
-| `visualize_base_reconstruction.py` | 重建结果可视化：RGB 对比图、光谱曲线、误差图 |
+## Degradation v1
 
-## 使用方式
+### 1. LR-HSI 退化模式
 
-1. 将本项目复制为新项目的起点。
-2. 在 `config.py` 的 `get_dataset_configs()` 中注册你的数据集。
-3. 实现你自己的模型（例如 `models/your_model.py`）。
-4. 在 `main.py`（或你自己的入口脚本）中串联 dataloader、模型、损失和训练循环。
+三种退化通过 `--degradation_mode` 切换：
 
-```python
-# 最小示例
-from config import parse_args
-from data_loader import build_loaders
-from losses import SAMLoss, DataConsistencyLoss
-from utils import set_seed, get_device
+- `bicubic`：纯 Bicubic 下采样；
+- `gaussian_bicubic`：Gaussian blur + Bicubic，下采样基线；
+- `physical`：Gaussian PSF/MTF + detector area averaging + sampling，作为当前主实验退化。
 
-cfg = parse_args()
-set_seed(cfg.seed)
-train_loader, test_loader, info = build_loaders(cfg)
+新实验默认：
 
-# model = YourModel(...)
-# criterion = ...
-# train loop ...
+```text
+degradation_mode = physical
+scale_ratio = 4
+mtf_nyquist = 0.2
+psf_truncate = 3.0
 ```
 
-## 目录结构约定
+旧 `make_lr_hsi()` 在未传入退化算子时仍保持 Gaussian+Bicubic 概念基线，避免旧脚本静默改变结果。
 
-```
-project/
-├── data/               # 数据和 SRF 权重
-│   ├── raw/            # 原始 HSI .mat 文件
-│   ├── wavelengths/    # 各数据集波长文件
-│   ├── srf/            # 原始 SRF CSV
-│   └── srf_weights/    # 预计算的 SRF 权重
-├── checkpoints/        # 模型权重
-├── logs/               # 训练日志
-├── outputs/            # 预测结果、指标、可视化
-├── models/             # 用户自己的模型定义
-└── code_template/      # 本模板（可作为 git submodule）
+### 2. Progressive degradation
+
+默认：
+
+```text
+T = 12
+scale stages = 1 -> 2 -> 4
+lift = auto
 ```
 
-## 扩展原则
+`auto` 会解析为：
 
-- 本模板只包含**与模型结构无关**的通用组件。
-- 具体模型实现、训练逻辑、对比实验等请放在模板外的独立模块中。
-- 对比模型建议统一放入 `models/baselines/`，配置统一放入 `configs/baselines/`。
+- `physical` → `normalized_adjoint`；
+- `bicubic / gaussian_bicubic` → `bilinear`。
+
+物理模式下：
+
+```math
+D_t = B_{r_t} P_t
+```
+
+```math
+\tilde D_t = U_t D_t
+```
+
+逆过程预留更新：
+
+```math
+x_{t-1}=x_t+\tilde D_{t-1}(\hat X_0)-\tilde D_t(\hat X_0)
+```
+
+所有 diffusion state 均位于 HR 网格。
+
+### 3. 数据端与扩散终点闭合
+
+`build_datasets()` 只构建一个 `degradation_operator`，训练集、测试集和 `ProgressiveDegradation` 共用该对象。
+
+必须满足：
+
+```math
+D_T(X)=Y_{LR-HSI}
+```
+
+对应测试位于：
+
+```text
+tests/test_degradation_closure.py
+tests/test_data_pipeline_degradation.py
+```
+
+## 退化轨迹 sanity check
+
+先把原始 HSI 放入：
+
+```text
+data/raw/PaviaU.mat
+data/raw/Houston13.mat
+data/raw/Chikusei.mat
+```
+
+### Physical 主实验轨迹
+
+```bash
+python check_degradation_trajectory.py \
+  --dataset PaviaU \
+  --mode physical \
+  --lift_mode auto \
+  --crop_size 128 \
+  --scale_ratio 4 \
+  --total_steps 12 \
+  --mtf_nyquist 0.2
+```
+
+### Gaussian+Bicubic 对照
+
+```bash
+python check_degradation_trajectory.py \
+  --dataset PaviaU \
+  --mode gaussian_bicubic \
+  --lift_mode auto \
+  --crop_size 128 \
+  --scale_ratio 4 \
+  --total_steps 12 \
+  --legacy_sigma 2.0 \
+  --legacy_kernel 5
+```
+
+### Bicubic 对照
+
+```bash
+python check_degradation_trajectory.py \
+  --dataset PaviaU \
+  --mode bicubic \
+  --lift_mode auto \
+  --crop_size 128 \
+  --scale_ratio 4 \
+  --total_steps 12
+```
+
+脚本逐时间步输出：
+
+```text
+t, scale, strength, scale_transition, step_l1,
+PSNR, SAM(deg), mean, std, HF ratio
+```
+
+重点先检查：
+
+1. `terminal_closure_max_abs_error` 是否接近 0；
+2. `mean` 是否在 1→2→4 切换时出现不合理幅值跳变；
+3. `step_l1` 在尺度切换点是否远高于邻近时间步；
+4. PSNR、HF ratio 是否总体随退化逐渐下降；
+5. SAM 是否保持合理，不出现由 lift 人为造成的突变。
+
+输出保存在：
+
+```text
+outputs/degradation_trajectory/
+```
+
+## HSI-MSI Fusion 数据
+
+正式融合实验建议使用真实 SRF：
+
+```bash
+python main.py \
+  --dataset PaviaU \
+  --degradation_mode physical \
+  --msi_mode srf
+```
+
+仓库已经包含 PaviaU、Houston13、Chikusei 的波长文件和 WorldView-2 SRF CSV；原始 HSI `.mat` 不提交到仓库。
+
+## 当前阶段
+
+当前先完成退化轨迹与数据闭合验证。只有真实 HSI 上的 trajectory sanity check 通过后，再接 clean HR-HSI predictor 和扩散训练循环；MSI 高频可迁移引导留到创新点 1 稳定后加入。

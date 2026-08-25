@@ -59,7 +59,7 @@ class ProgressiveDegradation:
         operator: BaseDegradation,
         total_steps: int = 12,
         stages: Optional[Sequence[int]] = None,
-        default_lift_mode: str = "normalized_adjoint",
+        default_lift_mode: Optional[str] = None,
     ):
         if total_steps < 1:
             raise ValueError("total_steps must be >= 1")
@@ -77,6 +77,12 @@ class ProgressiveDegradation:
             )
         if any(s < 1 for s in self.stages):
             raise ValueError("all stages must be >= 1")
+        if default_lift_mode is None:
+            default_lift_mode = (
+                "normalized_adjoint"
+                if operator.mode == "physical"
+                else "bilinear"
+            )
         self.default_lift_mode = default_lift_mode
 
     def _validate_t(self, t: int) -> int:

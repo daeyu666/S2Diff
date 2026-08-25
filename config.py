@@ -26,7 +26,7 @@ class TrainConfig:
     log_root: str = "./logs"
     output_root: str = "./outputs"
 
-    # --- 运行阶段（由用户自定义，模板不强制限制取值） ---
+    # --- 运行阶段 ---
     stage: str = "train"
     dataset: str = "PaviaU"
 
@@ -36,6 +36,20 @@ class TrainConfig:
     stride: int = 32
     scale_ratio: int = 4
     n_select_bands: int = 5
+
+    # --- LR-HSI 退化 ---
+    # 新实验默认使用物理退化；旧 make_lr_hsi() 函数仍保留 legacy 默认行为。
+    degradation_mode: str = "physical"  # bicubic / gaussian_bicubic / physical
+    degradation_sigma: float = 2.0       # gaussian_bicubic legacy sigma
+    degradation_kernel_size: int = 5     # gaussian_bicubic legacy kernel
+    mtf_nyquist: float = 0.2             # physical Gaussian PSF target MTF@LR Nyquist
+    psf_truncate: float = 3.0
+
+    # --- 渐进退化 ---
+    progressive_steps: int = 12
+    progressive_lift: str = "normalized_adjoint"
+    boundary_probability: float = 0.2
+    boundary_radius: int = 1
 
     # --- MSI 生成模式 ---
     msi_mode: str = "uniform"          # "uniform" 或 "srf"
@@ -70,15 +84,14 @@ class TrainConfig:
     resume: str = ""
     save_name: str = ""
 
-    # --- 数据集注册表（用户按需覆盖） ---
+    # --- 数据集注册表 ---
     datasets: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# 默认数据集配置（仅作为示例，用户可根据自己的数据自由增删）
+# 默认数据集配置
 # ---------------------------------------------------------------------------
 def get_dataset_configs():
-    """返回内置的示例数据集配置。用户可按需修改或替换。"""
     return {
         "PaviaU": DatasetConfig(
             name="PaviaU",
@@ -101,15 +114,38 @@ def get_dataset_configs():
     }
 
 
+def validate_config(cfg: TrainConfig):
+    if cfg.scale_ratio < 1:
+        raise ValueError("scale_ratio must be >= 1")
+    if cfg.progressive_steps < 1:
+        raise ValueError("progressive_steps must be >= 1")
+    if cfg.degradation_kernel_size < 1 or cfg.degradation_kernel_size % 2 == 0:
+        raise ValueError("degradation_kernel_size must be a positive odd integer")
+    if cfg.degradation_sigma < 0:
+        raise ValueError("degradation_sigma must be >= 0")
+    if not 0.0 < cfg.mtf_nyquist <= 1.0:
+        raise ValueError("mtf_nyquist must lie in (0, 1]")
+    if cfg.psf_truncate <= 0:
+        raise ValueError("psf_truncate must be > 0")
+    if not 0.0 <= cfg.boundary_probability <= 1.0:
+        raise ValueError("boundary_probability must lie in [0, 1]")
+    if cfg.boundary_radius < 0:
+        raise ValueError("boundary_radius must be >= 0")
+
+    if cfg.degradation_mode != "physical" and cfg.progressive_lift in (
+        "adjoint",
+        "normalized_adjoint",
+    ):
+        raise ValueError(
+            "adjoint/normalized_adjoint lift is only defined for physical "
+            "degradation; use bilinear or nearest for ordinary degradation"
+        )
+
+
 # ---------------------------------------------------------------------------
-# 命令行参数解析（通用部分；具体模型参数请在自身入口脚本中添加）
+# 命令行参数解析
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[List[str]] = None):
-    """解析命令行参数，返回 TrainConfig。
-
-    用户可以在自己的入口脚本中先调用本函数获得基础 cfg，
-    再用 parser.add_argument 追加模型相关参数。
-    """
     parser = argparse.ArgumentParser(description="HSI Super-Resolution Template")
 
     # --- 运行控制 ---
@@ -129,17 +165,49 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--scale_ratio", type=int, default=4)
     parser.add_argument("--n_select_bands", type=int, default=5)
 
+    # --- LR-HSI 退化 ---
+    parser.add_argument(
+        "--degradation_mode",
+        type=str,
+        default="physical",
+        choices=["bicubic", "gaussian_bicubic", "physical"],
+    )
+    parser.add_argument("--degradation_sigma", type=float, default=2.0)
+    parser.add_argument("--degradation_kernel_size", type=int, default=5)
+    parser.add_argument("--mtf_nyquist", type=float, default=0.2)
+    parser.add_argument("--psf_truncate", type=float, default=3.0)
+
+    # --- 渐进退化 ---
+    parser.add_argument("--progressive_steps", type=int, default=12)
+    parser.add_argument(
+        "--progressive_lift",
+        type=str,
+        default="normalized_adjoint",
+        choices=["bilinear", "nearest", "adjoint", "normalized_adjoint"],
+    )
+    parser.add_argument("--boundary_probability", type=float, default=0.2)
+    parser.add_argument("--boundary_radius", type=int, default=1)
+
     # --- MSI 生成 ---
-    parser.add_argument("--msi_mode", type=str, default="uniform",
-                        choices=["uniform", "srf"])
-    parser.add_argument("--srf_path", type=str,
-                        default="./data/srf/wv2_relative_spectral_response_data_for_i.atcorr.csv")
+    parser.add_argument(
+        "--msi_mode", type=str, default="uniform", choices=["uniform", "srf"]
+    )
+    parser.add_argument(
+        "--srf_path",
+        type=str,
+        default="./data/srf/wv2_relative_spectral_response_data_for_i.atcorr.csv",
+    )
     parser.add_argument("--wavelength_root", type=str, default="./data/wavelengths")
     parser.add_argument("--wavelength_path", type=str, default="")
-    parser.add_argument("--srf_interp", type=str, default="pchip",
-                        choices=["pchip", "linear"])
-    parser.add_argument("--srf_band_set", type=str, default="wv2_visible6",
-                        choices=["wv2_visible5", "wv2_visible6", "wv2_all8"])
+    parser.add_argument(
+        "--srf_interp", type=str, default="pchip", choices=["pchip", "linear"]
+    )
+    parser.add_argument(
+        "--srf_band_set",
+        type=str,
+        default="wv2_visible6",
+        choices=["wv2_visible5", "wv2_visible6", "wv2_all8"],
+    )
 
     # --- 训练 ---
     parser.add_argument("--epochs", type=int, default=300)
@@ -174,13 +242,12 @@ def parse_args(argv: Optional[List[str]] = None):
     for key, value in vars(args).items():
         setattr(cfg, key, value)
 
-    # 若命令行未显式指定 n_select_bands，则使用数据集默认值
     dataset_cfg = cfg.datasets.get(cfg.dataset)
     if dataset_cfg is not None:
         cfg.n_select_bands = args.n_select_bands or dataset_cfg.n_select_bands
 
+    validate_config(cfg)
     make_dirs(cfg)
-
     return cfg
 
 
@@ -188,7 +255,6 @@ def parse_args(argv: Optional[List[str]] = None):
 # 目录创建
 # ---------------------------------------------------------------------------
 def make_dirs(cfg: TrainConfig):
-    """根据配置创建必要的输出目录。"""
     dirs = [
         cfg.checkpoint_root,
         cfg.log_root,
@@ -205,7 +271,6 @@ def make_dirs(cfg: TrainConfig):
 # 辅助函数
 # ---------------------------------------------------------------------------
 def get_checkpoint_path(cfg: TrainConfig, stage: str = None, name: str = None):
-    """生成 checkpoint 路径。"""
     stage = stage or cfg.stage
     if name is None or name == "":
         name = f"{cfg.dataset}_{stage}.pth"
@@ -213,7 +278,6 @@ def get_checkpoint_path(cfg: TrainConfig, stage: str = None, name: str = None):
 
 
 def print_config(cfg: TrainConfig):
-    """打印当前配置（不打印 datasets 字典）。"""
     print("=" * 60)
     print("HSI Super-Resolution Template  Config")
     print("=" * 60)

@@ -1,11 +1,13 @@
 # data_loader.py
 import os
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+
+from degradations import ProgressiveDegradation, build_degradation
 from srf_utils import (
     WV2_VISIBLE_5_BANDS,
     WV2_VISIBLE_6_BANDS,
@@ -15,11 +17,6 @@ from srf_utils import (
     hsi_to_msi_numpy,
     print_srf_summary,
 )
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None
 
 try:
     import scipy.io as scio
@@ -38,15 +35,11 @@ except ImportError:
 
 
 def read_hsi_mat(file_path: str, candidate_keys: List[str]) -> np.ndarray:
-    """
-    读取.mat格式高光谱数据，返回H×W×C格式。
-    优先按candidate_keys读取，读取失败时自动寻找第一个三维数组。
-    """
+    """读取 .mat 高光谱数据并统一返回 H×W×C。"""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Cannot find data file: {file_path}")
 
     mat_data = None
-
     if hdf5storage is not None:
         try:
             mat_data = hdf5storage.loadmat(file_path)
@@ -62,9 +55,7 @@ def read_hsi_mat(file_path: str, candidate_keys: List[str]) -> np.ndarray:
     if mat_data is not None:
         for key in candidate_keys:
             if key in mat_data and isinstance(mat_data[key], np.ndarray):
-                img = mat_data[key]
-                return fix_hsi_shape(img)
-
+                return fix_hsi_shape(mat_data[key])
         for key, value in mat_data.items():
             if key.startswith("__"):
                 continue
@@ -75,9 +66,7 @@ def read_hsi_mat(file_path: str, candidate_keys: List[str]) -> np.ndarray:
         with h5py.File(file_path, "r") as f:
             for key in candidate_keys:
                 if key in f:
-                    img = np.array(f[key])
-                    return fix_hsi_shape(img)
-
+                    return fix_hsi_shape(np.array(f[key]))
             for key in f.keys():
                 value = np.array(f[key])
                 if value.ndim == 3:
@@ -87,122 +76,115 @@ def read_hsi_mat(file_path: str, candidate_keys: List[str]) -> np.ndarray:
 
 
 def fix_hsi_shape(img: np.ndarray) -> np.ndarray:
-    """
-    将输入统一为H×W×C。
-    部分v7.3 mat文件读出后可能是C×W×H或C×H×W，需要做简单判断。
-    """
-    img = np.array(img)
-    img = np.squeeze(img)
-
+    img = np.asarray(img).squeeze()
     if img.ndim != 3:
         raise ValueError(f"HSI data must be 3D, but got shape: {img.shape}")
 
-    # 若第一维像波段数，且后两维明显像空间尺寸，则转为H×W×C
     if img.shape[0] <= 256 and img.shape[1] > 256 and img.shape[2] > 256:
         img = np.transpose(img, (1, 2, 0))
-
-    # 若中间维像波段数，则转为H×W×C
     elif img.shape[1] <= 256 and img.shape[0] > 256 and img.shape[2] > 256:
         img = np.transpose(img, (0, 2, 1))
 
-    img = img.astype(np.float32)
-    return img
-
-
-def normalize_hsi(img: np.ndarray) -> np.ndarray:
-    """
-    归一化到[0,1]。
-    """
-    img = img.astype(np.float32)
-    min_value = float(np.min(img))
-    max_value = float(np.max(img))
-
-    if max_value - min_value < 1e-8:
-        return np.zeros_like(img, dtype=np.float32)
-
-    img = (img - min_value) / (max_value - min_value)
     return img.astype(np.float32)
 
 
+def normalize_hsi(img: np.ndarray) -> np.ndarray:
+    img = img.astype(np.float32)
+    min_value = float(np.min(img))
+    max_value = float(np.max(img))
+    if max_value - min_value < 1e-8:
+        return np.zeros_like(img, dtype=np.float32)
+    return ((img - min_value) / (max_value - min_value)).astype(np.float32)
+
+
 def crop_to_scale(img: np.ndarray, scale_ratio: int) -> np.ndarray:
-    """
-    裁掉不能被scale_ratio整除的边缘，避免下采样和上采样尺寸对不上。
-    """
-    h, w, c = img.shape
+    h, w, _ = img.shape
     new_h = h // scale_ratio * scale_ratio
     new_w = w // scale_ratio * scale_ratio
     return img[:new_h, :new_w, :]
 
 
-def gaussian_blur_bandwise(img: np.ndarray, kernel_size: int = 5, sigma: float = 2.0) -> np.ndarray:
-    """
-    对每个光谱波段分别做高斯模糊，避免OpenCV对多通道数量的限制。
-    """
-    if cv2 is None:
-        return img
-
-    blurred = np.zeros_like(img, dtype=np.float32)
-    for i in range(img.shape[2]):
-        blurred[:, :, i] = cv2.GaussianBlur(img[:, :, i], (kernel_size, kernel_size), sigma)
-    return blurred
+def hsi_to_tensor(img: np.ndarray) -> torch.Tensor:
+    """H×W×C -> C×H×W."""
+    return torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
 
 
-def resize_hsi(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """
-    对H×W×C格式HSI逐波段resize。
-    """
-    if cv2 is None:
-        tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
-        tensor = torch.nn.functional.interpolate(
-            tensor,
-            size=(target_h, target_w),
-            mode="bilinear",
-            align_corners=False,
+def tensor_to_hsi(x: torch.Tensor) -> np.ndarray:
+    """C×H×W -> H×W×C."""
+    if x.ndim != 3:
+        raise ValueError(f"Expected C×H×W tensor, got {tuple(x.shape)}")
+    return x.detach().cpu().permute(1, 2, 0).numpy().astype(np.float32)
+
+
+def build_hsi_degradation(cfg):
+    """Build the exact operator used by the dataset to generate LR-HSI."""
+    mode = getattr(cfg, "degradation_mode", "physical")
+    kwargs = {}
+    if mode == "gaussian_bicubic":
+        kwargs.update(
+            sigma=getattr(cfg, "degradation_sigma", 2.0),
+            kernel_size=getattr(cfg, "degradation_kernel_size", 5),
         )
-        return tensor.squeeze(0).permute(1, 2, 0).numpy().astype(np.float32)
-
-    out = np.zeros((target_h, target_w, img.shape[2]), dtype=np.float32)
-    for i in range(img.shape[2]):
-        out[:, :, i] = cv2.resize(
-            img[:, :, i],
-            (target_w, target_h),
-            interpolation=cv2.INTER_CUBIC,
+    elif mode == "physical":
+        kwargs.update(
+            mtf_nyquist=getattr(cfg, "mtf_nyquist", 0.2),
+            truncate=getattr(cfg, "psf_truncate", 3.0),
         )
-    return out
+    return build_degradation(mode, scale_ratio=cfg.scale_ratio, **kwargs)
 
 
-def make_lr_hsi(hr_hsi: np.ndarray, scale_ratio: int) -> np.ndarray:
+def build_progressive_degradation(cfg, degradation_operator=None):
+    operator = degradation_operator or build_hsi_degradation(cfg)
+    lift_mode = getattr(cfg, "progressive_lift", None)
+    if lift_mode is None:
+        lift_mode = (
+            "normalized_adjoint" if operator.mode == "physical" else "bilinear"
+        )
+    return ProgressiveDegradation(
+        operator=operator,
+        total_steps=getattr(cfg, "progressive_steps", 12),
+        default_lift_mode=lift_mode,
+    )
+
+
+def make_lr_hsi(
+    hr_hsi: np.ndarray,
+    scale_ratio: int,
+    degradation_operator=None,
+) -> np.ndarray:
+    """Generate LR-HSI.
+
+    Backward compatibility:
+    when no operator is supplied, reproduce the legacy conceptual baseline
+    (Gaussian sigma=2, kernel=5, then bicubic downsampling).
+
+    New experiments should build one operator from config and pass it into the
+    dataset so that dataset degradation and progressive terminal degradation
+    are the same object.
     """
-    按照旧data_loader.py的方式：
-    HR-HSI -> GaussianBlur -> resize，生成LR-HSI。
-    """
-    h, w, _ = hr_hsi.shape
-    blurred = gaussian_blur_bandwise(hr_hsi, kernel_size=5, sigma=2.0)
-    lr_hsi = resize_hsi(blurred, h // scale_ratio, w // scale_ratio)
-    return lr_hsi.astype(np.float32)
+    if degradation_operator is None:
+        degradation_operator = build_degradation(
+            "gaussian_bicubic",
+            scale_ratio=scale_ratio,
+            sigma=2.0,
+            kernel_size=5,
+        )
+
+    x = hsi_to_tensor(hr_hsi).unsqueeze(0)
+    with torch.no_grad():
+        y = degradation_operator.degrade(x).squeeze(0)
+    return tensor_to_hsi(y)
 
 
 def make_hr_msi(hr_hsi: np.ndarray, n_select_bands: int) -> np.ndarray:
-    """
-    没有光谱响应函数时，按照旧data_loader.py方式从HR-HSI均匀抽取波段生成HR-MSI。
-    """
+    """Fallback MSI generator used only when SRF mode is disabled."""
     n_bands = hr_hsi.shape[2]
-
     if n_select_bands > n_bands:
         raise ValueError(
             f"n_select_bands={n_select_bands} is larger than HSI bands={n_bands}"
         )
-
     band_indices = np.linspace(0, n_bands - 1, n_select_bands).round().astype(np.int64)
-    hr_msi = hr_hsi[:, :, band_indices]
-    return hr_msi.astype(np.float32)
-
-
-def hsi_to_tensor(img: np.ndarray) -> torch.Tensor:
-    """
-    H×W×C -> C×H×W
-    """
-    return torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
+    return hr_hsi[:, :, band_indices].astype(np.float32)
 
 
 def get_center_test_rect(h: int, w: int, test_size: int) -> Tuple[int, int, int, int]:
@@ -251,12 +233,12 @@ def build_patch_coords(
 
 
 class HSIHSRDataset(Dataset):
-    """
-    HSI-MSI融合超分数据集。
-    返回：
-        lr_hsi:  C×h×w
-        hr_msi:  c×H×W
-        gt:      C×H×W
+    """HSI-MSI fusion super-resolution dataset.
+
+    Returns:
+        lr_hsi: C×h×w
+        hr_msi: M×H×W
+        gt: C×H×W
     """
 
     def __init__(
@@ -271,9 +253,9 @@ class HSIHSRDataset(Dataset):
         test_size: int = 128,
         augment: bool = True,
         srf_weights=None,
+        degradation_operator=None,
     ):
         super().__init__()
-
         self.img = img
         self.dataset_name = dataset_name
         self.patch_size = patch_size
@@ -283,6 +265,12 @@ class HSIHSRDataset(Dataset):
         self.split = split
         self.augment = augment and split == "train"
         self.srf_weights = srf_weights
+        self.degradation_operator = degradation_operator or build_degradation(
+            "gaussian_bicubic",
+            scale_ratio=scale_ratio,
+            sigma=2.0,
+            kernel_size=5,
+        )
 
         h, w, _ = img.shape
         self.test_rect = get_center_test_rect(h, w, test_size)
@@ -318,20 +306,66 @@ class HSIHSRDataset(Dataset):
         if self.augment:
             gt = self.random_augment(gt)
 
-        lr_hsi = make_lr_hsi(gt, self.scale_ratio)
+        gt_tensor = hsi_to_tensor(gt)
+        with torch.no_grad():
+            lr_hsi = self.degradation_operator.degrade(
+                gt_tensor.unsqueeze(0)
+            ).squeeze(0)
+
         if self.srf_weights is not None:
             hr_msi = hsi_to_msi_numpy(gt, self.srf_weights)
         else:
             hr_msi = make_hr_msi(gt, self.n_select_bands)
 
-        sample = {
-            "lr_hsi": hsi_to_tensor(lr_hsi),
+        return {
+            "lr_hsi": lr_hsi.contiguous().float(),
             "hr_msi": hsi_to_tensor(hr_msi),
-            "gt": hsi_to_tensor(gt),
+            "gt": gt_tensor,
             "dataset_id": torch.tensor(0, dtype=torch.long),
             "n_bands": torch.tensor(gt.shape[2], dtype=torch.long),
         }
-        return sample
+
+
+def _build_srf(cfg, n_bands: int):
+    srf_weights = None
+    srf_band_names = None
+    hsi_wavelengths = None
+
+    if getattr(cfg, "msi_mode", "uniform") != "srf":
+        return srf_weights, srf_band_names, hsi_wavelengths, cfg.n_select_bands
+
+    wavelength_path = (
+        cfg.wavelength_path
+        if cfg.wavelength_path
+        else os.path.join(cfg.wavelength_root, f"{cfg.dataset}.txt")
+    )
+    hsi_wavelengths = load_hsi_wavelengths(
+        wavelength_path=wavelength_path,
+        n_bands=n_bands,
+    )
+
+    if cfg.srf_band_set == "wv2_visible5":
+        selected_bands = WV2_VISIBLE_5_BANDS
+    elif cfg.srf_band_set == "wv2_visible6":
+        selected_bands = WV2_VISIBLE_6_BANDS
+    elif cfg.srf_band_set == "wv2_all8":
+        selected_bands = WV2_ALL_8_BANDS
+    else:
+        raise ValueError(f"Unsupported srf_band_set: {cfg.srf_band_set}")
+
+    srf_weights, srf_band_names = build_srf_weights(
+        srf_path=cfg.srf_path,
+        hsi_wavelengths=hsi_wavelengths,
+        selected_bands=selected_bands,
+        interp_kind=cfg.srf_interp,
+        normalize=True,
+    )
+    print_srf_summary(
+        srf_weights=srf_weights,
+        band_names=srf_band_names,
+        hsi_wavelengths=hsi_wavelengths,
+    )
+    return srf_weights, srf_band_names, hsi_wavelengths, srf_weights.shape[0]
 
 
 def build_datasets(cfg):
@@ -345,48 +379,14 @@ def build_datasets(cfg):
     n_bands = img.shape[2]
     print(f"Loaded {cfg.dataset}: shape={img.shape}, bands={n_bands}")
 
-    srf_weights = None
-    srf_band_names = None
-    hsi_wavelengths = None
+    srf_weights, srf_band_names, hsi_wavelengths, n_select_bands = _build_srf(
+        cfg, n_bands
+    )
 
-    if getattr(cfg, "msi_mode", "uniform") == "srf":
-        if cfg.wavelength_path:
-            wavelength_path = cfg.wavelength_path
-        else:
-            wavelength_path = os.path.join(cfg.wavelength_root, f"{cfg.dataset}.txt")
-
-        hsi_wavelengths = load_hsi_wavelengths(
-            wavelength_path=wavelength_path,
-            n_bands=n_bands,
-        )
-
-        if cfg.srf_band_set == "wv2_visible5":
-            selected_bands = WV2_VISIBLE_5_BANDS
-        elif cfg.srf_band_set == "wv2_visible6":
-            selected_bands = WV2_VISIBLE_6_BANDS
-        elif cfg.srf_band_set == "wv2_all8":
-            selected_bands = WV2_ALL_8_BANDS
-        else:
-            raise ValueError(f"Unsupported srf_band_set: {cfg.srf_band_set}")
-
-        srf_weights, srf_band_names = build_srf_weights(
-            srf_path=cfg.srf_path,
-            hsi_wavelengths=hsi_wavelengths,
-            selected_bands=selected_bands,
-            interp_kind=cfg.srf_interp,
-            normalize=True,
-        )
-
-        print_srf_summary(
-            srf_weights=srf_weights,
-            band_names=srf_band_names,
-            hsi_wavelengths=hsi_wavelengths,
-        )
-
-        n_select_bands = srf_weights.shape[0]
-
-    else:
-        n_select_bands = cfg.n_select_bands
+    degradation_operator = build_hsi_degradation(cfg)
+    progressive_degradation = build_progressive_degradation(
+        cfg, degradation_operator=degradation_operator
+    )
 
     train_set = HSIHSRDataset(
         img=img,
@@ -396,6 +396,7 @@ def build_datasets(cfg):
         scale_ratio=cfg.scale_ratio,
         n_select_bands=n_select_bands,
         srf_weights=srf_weights,
+        degradation_operator=degradation_operator,
         split="train",
         test_size=cfg.image_size,
         augment=True,
@@ -409,6 +410,7 @@ def build_datasets(cfg):
         scale_ratio=cfg.scale_ratio,
         n_select_bands=n_select_bands,
         srf_weights=srf_weights,
+        degradation_operator=degradation_operator,
         split="test",
         test_size=cfg.image_size,
         augment=False,
@@ -421,6 +423,11 @@ def build_datasets(cfg):
         "scale_ratio": cfg.scale_ratio,
         "train_samples": len(train_set),
         "test_samples": len(test_set),
+        "degradation_mode": degradation_operator.mode,
+        "progressive_steps": progressive_degradation.total_steps,
+        "progressive_lift": progressive_degradation.default_lift_mode,
+        "degradation_operator": degradation_operator,
+        "progressive_degradation": progressive_degradation,
         "msi_mode": getattr(cfg, "msi_mode", "uniform"),
         "srf_weights": srf_weights,
         "srf_band_names": srf_band_names,

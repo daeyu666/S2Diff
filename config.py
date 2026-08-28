@@ -16,7 +16,7 @@ class DatasetConfig:
 
 @dataclass
 class TrainConfig:
-    """通用训练配置，不依赖具体模型结构。"""
+    """通用训练配置及Innovation 1实验配置。"""
 
     # --- 路径 ---
     project_root: str = "."
@@ -26,7 +26,7 @@ class TrainConfig:
     log_root: str = "./logs"
     output_root: str = "./outputs"
 
-    # --- 运行阶段（由用户自定义，模板不强制限制取值） ---
+    # --- 运行阶段 ---
     stage: str = "train"
     dataset: str = "PaviaU"
 
@@ -40,12 +40,29 @@ class TrainConfig:
     # --- MSI 生成模式 ---
     # 公平对比固定传感器：PaviaU -> IKONOS 4-band；
     # Houston13 / Chikusei -> WorldView-2 all8。
-    msi_mode: str = "srf"              # "uniform" 或 "srf"
-    srf_path: str = ""                 # 留空时由 srf_band_set / dataset 自动解析
+    # Innovation 1 predictor 暂不使用 MSI，但保留统一数据协议供后续Innovation 2使用。
+    msi_mode: str = "srf"
+    srf_path: str = ""
     wavelength_root: str = "./data/wavelengths"
     wavelength_path: str = ""
-    srf_interp: str = "pchip"          # "pchip" 或 "linear"
-    srf_band_set: str = "auto"         # auto / ikonos4 / WV2 variants
+    srf_interp: str = "pchip"
+    srf_band_set: str = "auto"
+
+    # --- Innovation 1: 渐进退化 ---
+    degradation_mode: str = "physical"  # physical / gaussian_bicubic / bicubic
+    diffusion_steps: int = 12
+    lift_mode: str = "auto"  # physical默认normalized_adjoint，普通退化默认bilinear
+    mtf_nyquist: float = 0.2
+    psf_truncate: float = 3.0
+    gaussian_sigma: float = 2.0
+    gaussian_kernel_size: int = 5
+    boundary_probability: float = 0.2
+    boundary_radius: int = 1
+
+    # --- Innovation 1: predictor ---
+    predictor_base_channels: int = 64
+    predictor_time_dim: int = 256
+    predictor_dropout: float = 0.0
 
     # --- 训练 ---
     epochs: int = 300
@@ -53,12 +70,15 @@ class TrainConfig:
     num_workers: int = 0
     lr: float = 1e-4
     weight_decay: float = 0.0
+    grad_clip: float = 1.0
     seed: int = 10
     device: str = "cuda"
 
     # --- 损失权重 ---
     lambda_l1: float = 1.0
     lambda_sam: float = 0.1
+    # 第一阶段默认关闭；基础模型稳定后可直接设置 >0 启用传感器域退化一致性损失。
+    lambda_deg: float = 0.0
     lambda_dc: float = 0.1
     lambda_sgrad: float = 0.05
     lambda_sdir: float = 0.2
@@ -72,7 +92,7 @@ class TrainConfig:
     resume: str = ""
     save_name: str = ""
 
-    # --- 数据集注册表（用户按需覆盖） ---
+    # --- 数据集注册表 ---
     datasets: dict = field(default_factory=dict)
 
 
@@ -104,14 +124,15 @@ def get_dataset_configs():
 
 
 # ---------------------------------------------------------------------------
-# 命令行参数解析（通用部分；具体模型参数请在自身入口脚本中添加）
+# 命令行参数解析
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[List[str]] = None):
-    """解析命令行参数，返回 TrainConfig。"""
-    parser = argparse.ArgumentParser(description="HSI Super-Resolution Template")
+    parser = argparse.ArgumentParser(
+        description="S2Diff Innovation 1: sensor-consistent progressive diffusion"
+    )
 
     # --- 运行控制 ---
-    parser.add_argument("--stage", type=str, default="train")
+    parser.add_argument("--stage", type=str, default="train", choices=["train", "test"])
     parser.add_argument("--dataset", type=str, default="PaviaU")
 
     # --- 路径 ---
@@ -161,18 +182,46 @@ def parse_args(argv: Optional[List[str]] = None):
         help="auto: PaviaU 使用 IKONOS4；Houston13/Chikusei 使用 WV2 all8。",
     )
 
+    # --- Innovation 1: 渐进退化 ---
+    parser.add_argument(
+        "--degradation_mode",
+        type=str,
+        default="physical",
+        choices=["physical", "gaussian_bicubic", "bicubic"],
+    )
+    parser.add_argument("--diffusion_steps", type=int, default=12)
+    parser.add_argument(
+        "--lift_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "bilinear", "nearest", "adjoint", "normalized_adjoint"],
+    )
+    parser.add_argument("--mtf_nyquist", type=float, default=0.2)
+    parser.add_argument("--psf_truncate", type=float, default=3.0)
+    parser.add_argument("--gaussian_sigma", type=float, default=2.0)
+    parser.add_argument("--gaussian_kernel_size", type=int, default=5)
+    parser.add_argument("--boundary_probability", type=float, default=0.2)
+    parser.add_argument("--boundary_radius", type=int, default=1)
+
+    # --- Innovation 1: predictor ---
+    parser.add_argument("--predictor_base_channels", type=int, default=64)
+    parser.add_argument("--predictor_time_dim", type=int, default=256)
+    parser.add_argument("--predictor_dropout", type=float, default=0.0)
+
     # --- 训练 ---
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
 
     # --- 损失权重 ---
     parser.add_argument("--lambda_l1", type=float, default=1.0)
     parser.add_argument("--lambda_sam", type=float, default=0.1)
+    parser.add_argument("--lambda_deg", type=float, default=0.0)
     parser.add_argument("--lambda_dc", type=float, default=0.1)
     parser.add_argument("--lambda_sgrad", type=float, default=0.05)
     parser.add_argument("--lambda_sdir", type=float, default=0.2)
@@ -195,11 +244,18 @@ def parse_args(argv: Optional[List[str]] = None):
         setattr(cfg, key, value)
 
     dataset_cfg = cfg.datasets.get(cfg.dataset)
-    if dataset_cfg is not None:
-        cfg.n_select_bands = args.n_select_bands or dataset_cfg.n_select_bands
+    if dataset_cfg is None:
+        raise ValueError(
+            f"Unknown dataset {cfg.dataset!r}; available: {sorted(cfg.datasets)}"
+        )
+    cfg.n_select_bands = args.n_select_bands or dataset_cfg.n_select_bands
+
+    if not 0.0 <= cfg.boundary_probability <= 1.0:
+        raise ValueError("boundary_probability must lie in [0, 1]")
+    if cfg.lambda_deg < 0.0:
+        raise ValueError("lambda_deg must be >= 0")
 
     make_dirs(cfg)
-
     return cfg
 
 
@@ -207,7 +263,6 @@ def parse_args(argv: Optional[List[str]] = None):
 # 目录创建
 # ---------------------------------------------------------------------------
 def make_dirs(cfg: TrainConfig):
-    """根据配置创建必要的输出目录。"""
     dirs = [
         cfg.checkpoint_root,
         cfg.log_root,
@@ -224,7 +279,6 @@ def make_dirs(cfg: TrainConfig):
 # 辅助函数
 # ---------------------------------------------------------------------------
 def get_checkpoint_path(cfg: TrainConfig, stage: str = None, name: str = None):
-    """生成 checkpoint 路径。"""
     stage = stage or cfg.stage
     if name is None or name == "":
         name = f"{cfg.dataset}_{stage}.pth"
@@ -232,9 +286,8 @@ def get_checkpoint_path(cfg: TrainConfig, stage: str = None, name: str = None):
 
 
 def print_config(cfg: TrainConfig):
-    """打印当前配置（不打印 datasets 字典）。"""
     print("=" * 60)
-    print("HSI Super-Resolution Template  Config")
+    print("S2Diff Innovation 1 Config")
     print("=" * 60)
     for key, value in cfg.__dict__.items():
         if key != "datasets":

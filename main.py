@@ -1,13 +1,235 @@
-"""
-HSI Super-Resolution 项目模板入口。
+"""S2Diff Innovation 1 training / evaluation entry point.
 
-本文件展示如何使用模板中的 dataloader、losses、metrics、utils 等工具。
-用户需要根据具体项目实现自己的模型、训练逻辑和阶段控制。
+This stage evaluates sensor-degradation-consistent progressive diffusion alone.
+The predictor receives only x_t and t; HR-MSI is deliberately excluded until
+Innovation 2 is introduced.
 """
+
+from __future__ import annotations
+
+import os
+
+import torch
 
 from config import parse_args, print_config
 from data_loader import build_loaders
-from utils import set_seed, get_device
+from innovation1 import build_progressive_process, evaluate, train_one_epoch
+from models import CleanHSIPredictor
+from utils import (
+    CSVLogger,
+    count_parameters,
+    ensure_dir,
+    get_device,
+    load_checkpoint,
+    save_checkpoint,
+    set_seed,
+)
+
+
+def _checkpoint_paths(cfg):
+    root = os.path.join(cfg.checkpoint_root, "innovation1")
+    ensure_dir(root)
+
+    if cfg.save_name:
+        filename = cfg.save_name
+        if not filename.endswith(".pth"):
+            filename += ".pth"
+    else:
+        filename = f"{cfg.dataset}_innovation1_{cfg.degradation_mode}.pth"
+
+    best_path = os.path.join(root, filename)
+    stem, ext = os.path.splitext(filename)
+    last_path = os.path.join(root, f"{stem}_last{ext}")
+    return best_path, last_path
+
+
+def _build_model(cfg, info, device):
+    model = CleanHSIPredictor(
+        n_bands=int(info["n_bands"]),
+        total_steps=int(cfg.diffusion_steps),
+        base_channels=int(cfg.predictor_base_channels),
+        time_dim=int(cfg.predictor_time_dim),
+        dropout=float(cfg.predictor_dropout),
+        residual_prediction=True,
+    ).to(device)
+    print(f"Predictor trainable params: {count_parameters(model):.3f} M")
+    return model
+
+
+def _format_metrics(metrics):
+    keys = ["PSNR", "SAM", "RMSE", "ERGAS", "SSIM", "CC", "INIT_PSNR", "INIT_SAM"]
+    parts = []
+    for key in keys:
+        if key in metrics:
+            parts.append(f"{key}={metrics[key]:.6f}")
+    return " ".join(parts)
+
+
+def run_train(cfg, train_loader, test_loader, info, device):
+    process = build_progressive_process(cfg)
+    model = _build_model(cfg, info, device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
+
+    best_path, last_path = _checkpoint_paths(cfg)
+    start_epoch = 1
+    best_psnr = float("-inf")
+
+    if cfg.resume:
+        loaded_epoch, loaded_best = load_checkpoint(
+            model,
+            cfg.resume,
+            optimizer=optimizer,
+            map_location=str(device),
+        )
+        start_epoch = int(loaded_epoch) + 1
+        best_psnr = float(loaded_best)
+        print(
+            f"Resumed from {cfg.resume}: epoch={loaded_epoch}, "
+            f"best_PSNR={best_psnr:.6f}"
+        )
+
+    transitions = process.transition_timesteps(radius=cfg.boundary_radius)
+    print(
+        "Innovation 1 process: "
+        f"mode={process.operator.mode}, T={process.total_steps}, "
+        f"lift={process.default_lift_mode}, transitions={transitions}"
+    )
+    if hasattr(process.operator, "extra_repr"):
+        print(f"Degradation operator: {process.operator.extra_repr()}")
+
+    log_path = os.path.join(
+        cfg.log_root,
+        f"{cfg.dataset}_innovation1_{cfg.degradation_mode}.csv",
+    )
+    logger = CSVLogger(
+        log_path,
+        fieldnames=[
+            "epoch",
+            "loss",
+            "l1",
+            "sam_loss",
+            "deg_loss",
+            "PSNR",
+            "SAM",
+            "RMSE",
+            "ERGAS",
+            "SSIM",
+            "CC",
+            "INIT_PSNR",
+            "INIT_SAM",
+            "best_PSNR",
+        ],
+    )
+
+    for epoch in range(start_epoch, cfg.epochs + 1):
+        stats = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            process,
+            device,
+            lambda_l1=cfg.lambda_l1,
+            lambda_sam=cfg.lambda_sam,
+            lambda_deg=cfg.lambda_deg,
+            boundary_probability=cfg.boundary_probability,
+            boundary_radius=cfg.boundary_radius,
+            grad_clip=cfg.grad_clip,
+        )
+
+        print(
+            f"Epoch {epoch:04d}/{cfg.epochs:04d} "
+            f"loss={stats.loss:.6f} l1={stats.l1:.6f} "
+            f"sam={stats.sam:.6f} deg={stats.deg:.6f}"
+        )
+
+        metrics = {}
+        if epoch % cfg.eval_interval == 0 or epoch == cfg.epochs:
+            metrics = evaluate(
+                model,
+                test_loader,
+                process,
+                device,
+                scale_ratio=cfg.scale_ratio,
+            )
+            print(f"  eval: {_format_metrics(metrics)}")
+
+            psnr = float(metrics["PSNR"])
+            if psnr > best_psnr:
+                best_psnr = psnr
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    epoch,
+                    best_psnr,
+                    best_path,
+                    extra={"config": vars(cfg), "metrics": metrics},
+                )
+                print(f"  saved best checkpoint -> {best_path}")
+
+        logger.write(
+            {
+                "epoch": epoch,
+                "loss": stats.loss,
+                "l1": stats.l1,
+                "sam_loss": stats.sam,
+                "deg_loss": stats.deg,
+                "PSNR": metrics.get("PSNR", ""),
+                "SAM": metrics.get("SAM", ""),
+                "RMSE": metrics.get("RMSE", ""),
+                "ERGAS": metrics.get("ERGAS", ""),
+                "SSIM": metrics.get("SSIM", ""),
+                "CC": metrics.get("CC", ""),
+                "INIT_PSNR": metrics.get("INIT_PSNR", ""),
+                "INIT_SAM": metrics.get("INIT_SAM", ""),
+                "best_PSNR": best_psnr,
+            }
+        )
+
+        if epoch % cfg.save_interval == 0 or epoch == cfg.epochs:
+            save_checkpoint(
+                model,
+                optimizer,
+                epoch,
+                best_psnr,
+                last_path,
+                extra={"config": vars(cfg), "metrics": metrics},
+            )
+
+    print(f"Training complete. best_PSNR={best_psnr:.6f}")
+    print(f"Best checkpoint: {best_path}")
+    print(f"Training log: {log_path}")
+
+
+def run_test(cfg, test_loader, info, device):
+    process = build_progressive_process(cfg)
+    model = _build_model(cfg, info, device)
+    best_path, _ = _checkpoint_paths(cfg)
+    checkpoint = cfg.resume or best_path
+
+    loaded_epoch, loaded_best = load_checkpoint(
+        model,
+        checkpoint,
+        optimizer=None,
+        map_location=str(device),
+        load_optimizer=False,
+    )
+    print(
+        f"Loaded checkpoint {checkpoint}: epoch={loaded_epoch}, "
+        f"stored_best_PSNR={loaded_best:.6f}"
+    )
+
+    metrics = evaluate(
+        model,
+        test_loader,
+        process,
+        device,
+        scale_ratio=cfg.scale_ratio,
+    )
+    print(f"Test metrics: {_format_metrics(metrics)}")
 
 
 def main():
@@ -15,38 +237,21 @@ def main():
     print_config(cfg)
     set_seed(cfg.seed)
 
-    # ---- 1. 构建数据加载器 ----
     train_loader, test_loader, info = build_loaders(cfg)
-
-    print(f"\nDataset info:")
-    for k, v in info.items():
-        if k not in ("srf_weights", "hsi_wavelengths"):
-            print(f"  {k}: {v}")
+    print("\nDataset info:")
+    for key, value in info.items():
+        if key not in ("srf_weights", "hsi_wavelengths"):
+            print(f"  {key}: {value}")
 
     device = get_device(cfg.device)
+    print(f"Device: {device}")
 
-    # ---- 2. 模型构建（用户自行实现） ----
-    # from your_model import YourModel
-    # model = YourModel(
-    #     n_bands=info["n_bands"],
-    #     n_select_bands=info["n_select_bands"],
-    #     scale_ratio=cfg.scale_ratio,
-    # ).to(device)
-
-    # ---- 3. 损失函数（按需选用模板中的 loss） ----
-    # from losses import SAMLoss, SpectralGradientLoss, DataConsistencyLoss
-    # criterion = ...
-
-    # ---- 4. 训练 / 测试循环（用户自行实现） ----
-    # for epoch in range(cfg.epochs):
-    #     train_one_epoch(...)
-    #     evaluate(...)
-
-    # ---- 5. 保存 checkpoint ----
-    # from utils import save_checkpoint
-    # save_checkpoint(model, optimizer, epoch, best_metric, path)
-
-    print("\nTemplate setup complete. Implement your model and training loop above.")
+    if cfg.stage == "train":
+        run_train(cfg, train_loader, test_loader, info, device)
+    elif cfg.stage == "test":
+        run_test(cfg, test_loader, info, device)
+    else:
+        raise ValueError(f"Unsupported stage: {cfg.stage}")
 
 
 if __name__ == "__main__":

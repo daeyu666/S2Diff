@@ -16,6 +16,17 @@ from srf_utils import (
     print_srf_summary,
 )
 
+
+IKONOS_4_BANDS = [
+    "IKONOS Blue",
+    "IKONOS Green",
+    "IKONOS Red",
+    "IKONOS NIR",
+]
+WV2_SRF_PATH = "./data/srf/wv2_relative_spectral_response_data_for_i.atcorr.csv"
+IKONOS_SRF_PATH = "./data/srf/ikonos_relative_spectral_response.csv"
+PAVIA_NOMINAL_WAVELENGTH_PATH = "./data/wavelengths/PaviaU_nominal_430_860.txt"
+
 try:
     import cv2
 except ImportError:
@@ -97,11 +108,8 @@ def fix_hsi_shape(img: np.ndarray) -> np.ndarray:
     if img.ndim != 3:
         raise ValueError(f"HSI data must be 3D, but got shape: {img.shape}")
 
-    # 若第一维像波段数，且后两维明显像空间尺寸，则转为H×W×C
     if img.shape[0] <= 256 and img.shape[1] > 256 and img.shape[2] > 256:
         img = np.transpose(img, (1, 2, 0))
-
-    # 若中间维像波段数，则转为H×W×C
     elif img.shape[1] <= 256 and img.shape[0] > 256 and img.shape[2] > 256:
         img = np.transpose(img, (0, 2, 1))
 
@@ -110,9 +118,7 @@ def fix_hsi_shape(img: np.ndarray) -> np.ndarray:
 
 
 def normalize_hsi(img: np.ndarray) -> np.ndarray:
-    """
-    归一化到[0,1]。
-    """
+    """归一化到[0,1]。"""
     img = img.astype(np.float32)
     min_value = float(np.min(img))
     max_value = float(np.max(img))
@@ -125,9 +131,7 @@ def normalize_hsi(img: np.ndarray) -> np.ndarray:
 
 
 def crop_to_scale(img: np.ndarray, scale_ratio: int) -> np.ndarray:
-    """
-    裁掉不能被scale_ratio整除的边缘，避免下采样和上采样尺寸对不上。
-    """
+    """裁掉不能被scale_ratio整除的边缘。"""
     h, w, c = img.shape
     new_h = h // scale_ratio * scale_ratio
     new_w = w // scale_ratio * scale_ratio
@@ -135,9 +139,7 @@ def crop_to_scale(img: np.ndarray, scale_ratio: int) -> np.ndarray:
 
 
 def gaussian_blur_bandwise(img: np.ndarray, kernel_size: int = 5, sigma: float = 2.0) -> np.ndarray:
-    """
-    对每个光谱波段分别做高斯模糊，避免OpenCV对多通道数量的限制。
-    """
+    """对每个光谱波段分别做高斯模糊。"""
     if cv2 is None:
         return img
 
@@ -148,9 +150,7 @@ def gaussian_blur_bandwise(img: np.ndarray, kernel_size: int = 5, sigma: float =
 
 
 def resize_hsi(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """
-    对H×W×C格式HSI逐波段resize。
-    """
+    """对H×W×C格式HSI逐波段resize。"""
     if cv2 is None:
         tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
         tensor = torch.nn.functional.interpolate(
@@ -172,10 +172,7 @@ def resize_hsi(img: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
 
 
 def make_lr_hsi(hr_hsi: np.ndarray, scale_ratio: int) -> np.ndarray:
-    """
-    按照旧data_loader.py的方式：
-    HR-HSI -> GaussianBlur -> resize，生成LR-HSI。
-    """
+    """HR-HSI -> GaussianBlur -> bicubic resize，生成LR-HSI。"""
     h, w, _ = hr_hsi.shape
     blurred = gaussian_blur_bandwise(hr_hsi, kernel_size=5, sigma=2.0)
     lr_hsi = resize_hsi(blurred, h // scale_ratio, w // scale_ratio)
@@ -183,9 +180,7 @@ def make_lr_hsi(hr_hsi: np.ndarray, scale_ratio: int) -> np.ndarray:
 
 
 def make_hr_msi(hr_hsi: np.ndarray, n_select_bands: int) -> np.ndarray:
-    """
-    没有光谱响应函数时，按照旧data_loader.py方式从HR-HSI均匀抽取波段生成HR-MSI。
-    """
+    """关闭SRF模式时，从HR-HSI均匀抽取波段生成HR-MSI。"""
     n_bands = hr_hsi.shape[2]
 
     if n_select_bands > n_bands:
@@ -199,9 +194,7 @@ def make_hr_msi(hr_hsi: np.ndarray, n_select_bands: int) -> np.ndarray:
 
 
 def hsi_to_tensor(img: np.ndarray) -> torch.Tensor:
-    """
-    H×W×C -> C×H×W
-    """
+    """H×W×C -> C×H×W。"""
     return torch.from_numpy(img).permute(2, 0, 1).contiguous().float()
 
 
@@ -251,13 +244,7 @@ def build_patch_coords(
 
 
 class HSIHSRDataset(Dataset):
-    """
-    HSI-MSI融合超分数据集。
-    返回：
-        lr_hsi:  C×h×w
-        hr_msi:  c×H×W
-        gt:      C×H×W
-    """
+    """HSI-MSI融合超分数据集。"""
 
     def __init__(
         self,
@@ -334,6 +321,60 @@ class HSIHSRDataset(Dataset):
         return sample
 
 
+def _resolve_srf_spec(cfg, n_bands: int):
+    """解析与对比实验一致的固定传感器协议。"""
+    requested = getattr(cfg, "srf_band_set", "auto")
+    if requested == "auto":
+        resolved = "ikonos4" if cfg.dataset == "PaviaU" else "wv2_all8"
+    else:
+        resolved = requested
+
+    if resolved == "ikonos4":
+        selected_bands = IKONOS_4_BANDS
+        default_srf_path = IKONOS_SRF_PATH
+    elif resolved == "wv2_visible5":
+        selected_bands = WV2_VISIBLE_5_BANDS
+        default_srf_path = WV2_SRF_PATH
+    elif resolved == "wv2_visible6":
+        selected_bands = WV2_VISIBLE_6_BANDS
+        default_srf_path = WV2_SRF_PATH
+    elif resolved == "wv2_all8":
+        selected_bands = WV2_ALL_8_BANDS
+        default_srf_path = WV2_SRF_PATH
+    else:
+        raise ValueError(f"Unsupported srf_band_set: {resolved}")
+
+    srf_path = getattr(cfg, "srf_path", "") or default_srf_path
+
+    if getattr(cfg, "wavelength_path", ""):
+        wavelength_path = cfg.wavelength_path
+        hsi_wavelengths = load_hsi_wavelengths(
+            wavelength_path=wavelength_path,
+            n_bands=n_bands,
+        )
+    elif cfg.dataset == "PaviaU" and resolved == "ikonos4":
+        wavelength_path = PAVIA_NOMINAL_WAVELENGTH_PATH
+        if n_bands == 103 and os.path.exists(wavelength_path):
+            hsi_wavelengths = load_hsi_wavelengths(
+                wavelength_path=wavelength_path,
+                n_bands=n_bands,
+            )
+        else:
+            hsi_wavelengths = np.linspace(430.0, 860.0, n_bands).astype(np.float32)
+            wavelength_path = f"nominal:430-860nm/{n_bands}bands"
+    else:
+        wavelength_path = os.path.join(cfg.wavelength_root, f"{cfg.dataset}.txt")
+        hsi_wavelengths = load_hsi_wavelengths(
+            wavelength_path=wavelength_path,
+            n_bands=n_bands,
+        )
+
+    cfg.resolved_srf_band_set = resolved
+    cfg.resolved_srf_path = srf_path
+    cfg.resolved_wavelength_path = wavelength_path
+    return srf_path, selected_bands, hsi_wavelengths, wavelength_path, resolved
+
+
 def build_datasets(cfg):
     dataset_cfg = cfg.datasets[cfg.dataset]
     file_path = os.path.join(cfg.data_root, dataset_cfg.file_name)
@@ -348,35 +389,31 @@ def build_datasets(cfg):
     srf_weights = None
     srf_band_names = None
     hsi_wavelengths = None
+    resolved_band_set = None
+    resolved_srf_path = None
+    resolved_wavelength_path = None
 
-    if getattr(cfg, "msi_mode", "uniform") == "srf":
-        if cfg.wavelength_path:
-            wavelength_path = cfg.wavelength_path
-        else:
-            wavelength_path = os.path.join(cfg.wavelength_root, f"{cfg.dataset}.txt")
-
-        hsi_wavelengths = load_hsi_wavelengths(
-            wavelength_path=wavelength_path,
-            n_bands=n_bands,
-        )
-
-        if cfg.srf_band_set == "wv2_visible5":
-            selected_bands = WV2_VISIBLE_5_BANDS
-        elif cfg.srf_band_set == "wv2_visible6":
-            selected_bands = WV2_VISIBLE_6_BANDS
-        elif cfg.srf_band_set == "wv2_all8":
-            selected_bands = WV2_ALL_8_BANDS
-        else:
-            raise ValueError(f"Unsupported srf_band_set: {cfg.srf_band_set}")
+    if getattr(cfg, "msi_mode", "srf") == "srf":
+        (
+            resolved_srf_path,
+            selected_bands,
+            hsi_wavelengths,
+            resolved_wavelength_path,
+            resolved_band_set,
+        ) = _resolve_srf_spec(cfg, n_bands)
 
         srf_weights, srf_band_names = build_srf_weights(
-            srf_path=cfg.srf_path,
+            srf_path=resolved_srf_path,
             hsi_wavelengths=hsi_wavelengths,
             selected_bands=selected_bands,
             interp_kind=cfg.srf_interp,
             normalize=True,
         )
 
+        print(
+            f"Resolved SRF: dataset={cfg.dataset}, profile={resolved_band_set}, "
+            f"path={resolved_srf_path}, wavelength_grid={resolved_wavelength_path}"
+        )
         print_srf_summary(
             srf_weights=srf_weights,
             band_names=srf_band_names,
@@ -384,7 +421,6 @@ def build_datasets(cfg):
         )
 
         n_select_bands = srf_weights.shape[0]
-
     else:
         n_select_bands = cfg.n_select_bands
 
@@ -421,7 +457,10 @@ def build_datasets(cfg):
         "scale_ratio": cfg.scale_ratio,
         "train_samples": len(train_set),
         "test_samples": len(test_set),
-        "msi_mode": getattr(cfg, "msi_mode", "uniform"),
+        "msi_mode": getattr(cfg, "msi_mode", "srf"),
+        "srf_profile": resolved_band_set,
+        "srf_path": resolved_srf_path,
+        "wavelength_path": resolved_wavelength_path,
         "srf_weights": srf_weights,
         "srf_band_names": srf_band_names,
         "hsi_wavelengths": hsi_wavelengths,

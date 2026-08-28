@@ -4,6 +4,7 @@ import torch
 
 from degradations import PhysicalDegradation, ProgressiveDegradation
 from innovation1 import batch_state_at, reconstruct_from_terminal_lr, train_one_epoch
+from losses import SAMLoss
 from models import CleanHSIPredictor
 
 
@@ -23,6 +24,22 @@ def _small_process(total_steps=4):
         PhysicalDegradation(scale_ratio=4, mtf_nyquist=0.2),
         total_steps=total_steps,
     )
+
+
+def test_sam_loss_has_finite_gradient_for_collinear_spectra():
+    """Regression test for the acos(1) -> infinite-gradient failure mode."""
+    torch.manual_seed(0)
+    target = torch.rand(2, 6, 8, 8)
+
+    # Exact positive rescaling preserves every spectral direction, so SAM=0.
+    # This is a realistic corner case for shared spatial HSI degradation and
+    # must not create infinite/NaN gradients during clean-X0 training.
+    pred = (0.75 * target).clone().requires_grad_(True)
+    loss = SAMLoss()(pred, target)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(pred.grad).all()
 
 
 def test_predictor_shape_and_identity_initialization():
@@ -74,6 +91,10 @@ def test_one_training_step_runs_without_msi():
     assert stats.loss > 0.0
     assert stats.l1 > 0.0
     assert torch.isfinite(torch.tensor(stats.loss))
+
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            assert torch.isfinite(parameter).all()
 
 
 def test_reverse_inference_starts_from_terminal_lr_and_returns_hr_grid():

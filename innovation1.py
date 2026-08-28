@@ -73,7 +73,7 @@ def batch_state_at(
 ) -> torch.Tensor:
     """Evaluate D~_t(x) for a batch whose samples may use different t.
 
-    ProgressiveDegradation.state_at takes one integer timestep.  Grouping by t
+    ProgressiveDegradation.state_at takes one integer timestep. Grouping by t
     keeps the implementation vectorized inside each group and, unlike a
     preallocated in-place scatter, also preserves autograd when this helper is
     later reused for predicted X0 states.
@@ -129,6 +129,27 @@ def degradation_consistency_loss(
     return total
 
 
+def _ensure_finite(
+    name: str,
+    value: torch.Tensor,
+    timesteps: Optional[torch.Tensor] = None,
+) -> None:
+    """Stop immediately at the first numerical failure instead of saving NaNs."""
+    if torch.isfinite(value).all():
+        return
+
+    message = f"Non-finite value detected in {name}"
+    if timesteps is not None:
+        message += f"; timesteps={timesteps.detach().cpu().tolist()}"
+    finite = value.detach()[torch.isfinite(value.detach())]
+    if finite.numel() > 0:
+        message += (
+            f"; finite_min={finite.min().item():.6e}"
+            f"; finite_max={finite.max().item():.6e}"
+        )
+    raise FloatingPointError(message)
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     loader,
@@ -154,10 +175,11 @@ def train_one_epoch(
 
     for batch in loader:
         # Innovation 1 intentionally ignores batch['hr_msi'] and the legacy
-        # batch['lr_hsi'].  x_t is synthesized from GT through the exact same
+        # batch['lr_hsi']. x_t is synthesized from GT through the exact same
         # progressive operator used at the terminal observation.
         gt = batch["gt"].to(device, non_blocking=True)
         batch_size = gt.shape[0]
+        _ensure_finite("gt", gt)
 
         timesteps = process.sample_timesteps(
             batch_size,
@@ -168,24 +190,39 @@ def train_one_epoch(
 
         with torch.no_grad():
             x_t = batch_state_at(process, gt, timesteps)
+        _ensure_finite("x_t", x_t, timesteps)
 
         pred_x0 = model(x_t, timesteps)
+        _ensure_finite("pred_x0", pred_x0, timesteps)
+
         l1 = F.l1_loss(pred_x0, gt)
         sam = sam_loss_fn(pred_x0, gt)
+        _ensure_finite("L1 loss", l1, timesteps)
+        _ensure_finite("SAM loss", sam, timesteps)
 
         if lambda_deg > 0.0:
             deg = degradation_consistency_loss(
                 process, pred_x0, gt, timesteps
             )
+            _ensure_finite("degradation consistency loss", deg, timesteps)
         else:
             deg = pred_x0.new_zeros(())
 
         loss = lambda_l1 * l1 + lambda_sam * sam + lambda_deg * deg
+        _ensure_finite("total loss", loss, timesteps)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        if grad_clip is not None and grad_clip > 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        # The previous SAM implementation could create +/-inf gradients while
+        # keeping its forward value finite. error_if_nonfinite makes that class
+        # of failure visible at the exact batch where it occurs.
+        max_norm = float(grad_clip) if grad_clip is not None and grad_clip > 0.0 else float("inf")
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=max_norm,
+            error_if_nonfinite=True,
+        )
         optimizer.step()
 
         loss_meter.update(loss.item(), batch_size)
@@ -238,7 +275,7 @@ def evaluate(
     """Evaluate the full T->0 reverse process under the selected degradation.
 
     For synthetic benchmark data the LR observation is regenerated from GT via
-    process.terminal_observation().  This is deliberate: the generic dataset
+    process.terminal_observation(). This is deliberate: the generic dataset
     still exposes its historical Gaussian+bicubic lr_hsi field, which must not
     be used when evaluating the physical-degradation innovation.
     """

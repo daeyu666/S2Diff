@@ -35,15 +35,17 @@ class TrainConfig:
     patch_size: int = 64
     stride: int = 32
     scale_ratio: int = 4
-    n_select_bands: int = 5
+    n_select_bands: int = 4
 
     # --- MSI 生成模式 ---
-    msi_mode: str = "uniform"          # "uniform" 或 "srf"
-    srf_path: str = "./data/srf/wv2_relative_spectral_response_data_for_i.atcorr.csv"
+    # 公平对比固定传感器：PaviaU -> IKONOS 4-band；
+    # Houston13 / Chikusei -> WorldView-2 all8。
+    msi_mode: str = "srf"              # "uniform" 或 "srf"
+    srf_path: str = ""                 # 留空时由 srf_band_set / dataset 自动解析
     wavelength_root: str = "./data/wavelengths"
     wavelength_path: str = ""
     srf_interp: str = "pchip"          # "pchip" 或 "linear"
-    srf_band_set: str = "wv2_visible6" # "wv2_visible5" / "wv2_visible6" / "wv2_all8"
+    srf_band_set: str = "auto"         # auto / ikonos4 / WV2 variants
 
     # --- 训练 ---
     epochs: int = 300
@@ -75,16 +77,16 @@ class TrainConfig:
 
 
 # ---------------------------------------------------------------------------
-# 默认数据集配置（仅作为示例，用户可根据自己的数据自由增删）
+# 默认数据集配置
 # ---------------------------------------------------------------------------
 def get_dataset_configs():
-    """返回内置的示例数据集配置。用户可按需修改或替换。"""
+    """返回统一实验使用的数据集配置。"""
     return {
         "PaviaU": DatasetConfig(
             name="PaviaU",
             file_name="PaviaU.mat",
             mat_keys=["paviaU", "PaviaU", "img", "data"],
-            n_select_bands=6,
+            n_select_bands=4,
         ),
         "Houston13": DatasetConfig(
             name="Houston13",
@@ -105,11 +107,7 @@ def get_dataset_configs():
 # 命令行参数解析（通用部分；具体模型参数请在自身入口脚本中添加）
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[List[str]] = None):
-    """解析命令行参数，返回 TrainConfig。
-
-    用户可以在自己的入口脚本中先调用本函数获得基础 cfg，
-    再用 parser.add_argument 追加模型相关参数。
-    """
+    """解析命令行参数，返回 TrainConfig。"""
     parser = argparse.ArgumentParser(description="HSI Super-Resolution Template")
 
     # --- 运行控制 ---
@@ -127,19 +125,41 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--patch_size", type=int, default=64)
     parser.add_argument("--stride", type=int, default=32)
     parser.add_argument("--scale_ratio", type=int, default=4)
-    parser.add_argument("--n_select_bands", type=int, default=5)
+    parser.add_argument(
+        "--n_select_bands",
+        type=int,
+        default=0,
+        help="0 表示使用数据集默认通道数；SRF 模式下由实际 SRF 通道数覆盖。",
+    )
 
     # --- MSI 生成 ---
-    parser.add_argument("--msi_mode", type=str, default="uniform",
-                        choices=["uniform", "srf"])
-    parser.add_argument("--srf_path", type=str,
-                        default="./data/srf/wv2_relative_spectral_response_data_for_i.atcorr.csv")
+    parser.add_argument(
+        "--msi_mode",
+        type=str,
+        default="srf",
+        choices=["uniform", "srf"],
+    )
+    parser.add_argument(
+        "--srf_path",
+        type=str,
+        default="",
+        help="可选显式 SRF CSV；留空时按数据集和 srf_band_set 自动选择。",
+    )
     parser.add_argument("--wavelength_root", type=str, default="./data/wavelengths")
     parser.add_argument("--wavelength_path", type=str, default="")
-    parser.add_argument("--srf_interp", type=str, default="pchip",
-                        choices=["pchip", "linear"])
-    parser.add_argument("--srf_band_set", type=str, default="wv2_visible6",
-                        choices=["wv2_visible5", "wv2_visible6", "wv2_all8"])
+    parser.add_argument(
+        "--srf_interp",
+        type=str,
+        default="pchip",
+        choices=["pchip", "linear"],
+    )
+    parser.add_argument(
+        "--srf_band_set",
+        type=str,
+        default="auto",
+        choices=["auto", "ikonos4", "wv2_visible5", "wv2_visible6", "wv2_all8"],
+        help="auto: PaviaU 使用 IKONOS4；Houston13/Chikusei 使用 WV2 all8。",
+    )
 
     # --- 训练 ---
     parser.add_argument("--epochs", type=int, default=300)
@@ -174,7 +194,6 @@ def parse_args(argv: Optional[List[str]] = None):
     for key, value in vars(args).items():
         setattr(cfg, key, value)
 
-    # 若命令行未显式指定 n_select_bands，则使用数据集默认值
     dataset_cfg = cfg.datasets.get(cfg.dataset)
     if dataset_cfg is not None:
         cfg.n_select_bands = args.n_select_bands or dataset_cfg.n_select_bands

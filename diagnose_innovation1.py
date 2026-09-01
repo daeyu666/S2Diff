@@ -1,4 +1,4 @@
-"""Diagnose predictor capacity and reverse-state drift for V1/V2/V3."""
+"""Diagnose predictor capacity and reverse-state drift for V1/V2/V3 ablations."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from innovation1 import build_progressive_process, model_predict
 from metrics import MetricAverager, calc_metrics
 from models import (
     CleanHSIPredictor,
-    MSIHighFrequencyGuidedPredictor,
+    MSIAblationGuidedPredictor,
     SpectralSpatialCleanHSIPredictor,
 )
 from utils import count_parameters, ensure_dir, get_device, load_checkpoint, set_seed
@@ -30,7 +30,10 @@ def _predictor_tag(cfg):
     if version == "v2":
         return "_v2" if base_channels == 64 else f"_v2_bc{base_channels}"
     if version == "v3":
-        return "_v3" if base_channels == 64 else f"_v3_bc{base_channels}"
+        ablation = str(getattr(cfg, "msi_ablation", "full")).lower()
+        mode_tag = "" if ablation == "full" else f"_{ablation}"
+        width_tag = "" if base_channels == 64 else f"_bc{base_channels}"
+        return f"_v3{mode_tag}{width_tag}"
     raise ValueError(f"Unsupported predictor_version: {version}")
 
 
@@ -66,18 +69,21 @@ def _build_model(cfg, info, device):
             spectral_hidden=int(cfg.spectral_stem_hidden),
         )
     elif version == "v3":
-        model = MSIHighFrequencyGuidedPredictor(
+        model = MSIAblationGuidedPredictor(
             **common,
             n_msi_bands=int(info["n_select_bands"]),
             spectral_hidden=int(cfg.spectral_stem_hidden),
             msi_highpass_kernel=int(cfg.msi_highpass_kernel),
             msi_highpass_sigma=float(cfg.msi_highpass_sigma),
+            msi_ablation=str(getattr(cfg, "msi_ablation", "full")),
         )
     else:
         raise ValueError(f"Unsupported predictor_version: {version}")
     model = model.to(device)
+    ablation = str(getattr(cfg, "msi_ablation", "full")) if version == "v3" else "n/a"
     print(
-        f"Predictor version={version}, params={count_parameters(model):.3f} M, "
+        f"Predictor version={version}, msi_ablation={ablation}, "
+        f"params={count_parameters(model):.3f} M, "
         f"requires_msi={bool(getattr(model, 'requires_msi', False))}"
     )
     return model
@@ -124,7 +130,9 @@ def run_diagnostic(cfg, test_loader, info, device):
     print(
         f"Loaded checkpoint: {checkpoint}\n"
         f"  epoch={loaded_epoch}, stored_best_PSNR={loaded_best:.6f}\n"
-        f"  predictor={cfg.predictor_version}, base_channels={cfg.predictor_base_channels}\n"
+        f"  predictor={cfg.predictor_version}, "
+        f"msi_ablation={getattr(cfg, 'msi_ablation', 'full')}, "
+        f"base_channels={cfg.predictor_base_channels}\n"
         f"  degradation={process.operator.mode}, T={process.total_steps}, "
         f"lift={process.default_lift_mode}"
     )

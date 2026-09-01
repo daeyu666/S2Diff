@@ -31,6 +31,11 @@ from models import CleanHSIPredictor
 from utils import count_parameters, ensure_dir, get_device, load_checkpoint, set_seed
 
 
+def _predictor_tag(cfg):
+    base_channels = int(cfg.predictor_base_channels)
+    return "" if base_channels == 64 else f"_bc{base_channels}"
+
+
 def _default_checkpoint(cfg) -> str:
     root = os.path.join(cfg.checkpoint_root, "innovation1")
     if cfg.save_name:
@@ -38,7 +43,10 @@ def _default_checkpoint(cfg) -> str:
         if not filename.endswith(".pth"):
             filename += ".pth"
     else:
-        filename = f"{cfg.dataset}_innovation1_{cfg.degradation_mode}.pth"
+        filename = (
+            f"{cfg.dataset}_innovation1_{cfg.degradation_mode}"
+            f"{_predictor_tag(cfg)}.pth"
+        )
     return os.path.join(root, filename)
 
 
@@ -98,6 +106,7 @@ def run_diagnostic(cfg, test_loader, info, device):
     print(
         f"Loaded checkpoint: {checkpoint}\n"
         f"  epoch={loaded_epoch}, stored_best_PSNR={loaded_best:.6f}\n"
+        f"  base_channels={cfg.predictor_base_channels}\n"
         f"  degradation={process.operator.mode}, T={process.total_steps}, "
         f"lift={process.default_lift_mode}"
     )
@@ -118,9 +127,6 @@ def run_diagnostic(cfg, test_loader, info, device):
             gt = batch["gt"].to(device, non_blocking=True)
             target_size = tuple(gt.shape[-2:])
 
-            # ---------------------------------------------------------------
-            # A. Oracle-state predictor: network always sees exact D~_t(X).
-            # ---------------------------------------------------------------
             oracle_states = {}
             for t in range(1, T + 1):
                 oracle_state = process.state_at(gt, t)
@@ -133,9 +139,6 @@ def run_diagnostic(cfg, test_loader, info, device):
                     calc_metrics(oracle_pred, gt, cfg.scale_ratio)
                 )
 
-            # ---------------------------------------------------------------
-            # B. Terminal one-shot from the actual terminal observation.
-            # ---------------------------------------------------------------
             terminal_lr = process.terminal_observation(gt)
             x_t = process.terminal_state(terminal_lr, target_size=target_size)
             init_meter.update(calc_metrics(x_t, gt, cfg.scale_ratio))
@@ -146,10 +149,6 @@ def run_diagnostic(cfg, test_loader, info, device):
             one_shot = model(x_t, timestep_T)
             one_shot_meter.update(calc_metrics(one_shot, gt, cfg.scale_ratio))
 
-            # ---------------------------------------------------------------
-            # C. Full reverse. At every t compare the recursively generated
-            # state with the exact oracle state D~_t(X).
-            # ---------------------------------------------------------------
             reverse_state_meters[T].update(
                 calc_metrics(x_t, gt, cfg.scale_ratio)
             )
@@ -175,10 +174,7 @@ def run_diagnostic(cfg, test_loader, info, device):
                 )
                 range_rows[prev_t].append(_range_stats(x_prev))
 
-                if prev_t > 0:
-                    oracle_prev = oracle_states[prev_t]
-                else:
-                    oracle_prev = gt
+                oracle_prev = oracle_states[prev_t] if prev_t > 0 else gt
                 drift_rows[prev_t].append(
                     float(torch.mean(torch.abs(x_prev - oracle_prev)).item())
                 )
@@ -197,9 +193,6 @@ def run_diagnostic(cfg, test_loader, info, device):
         t: reverse_state_meters[t].average() for t in range(0, T + 1)
     }
 
-    # -----------------------------------------------------------------------
-    # Console report.
-    # -----------------------------------------------------------------------
     print("\n=== Global comparison ===")
     print(
         f"INIT state       : PSNR={init_metrics['PSNR']:.4f} "
@@ -250,12 +243,12 @@ def run_diagnostic(cfg, test_loader, info, device):
             f"{drift:.6e}"
         )
 
-    # -----------------------------------------------------------------------
-    # Save machine-readable CSVs for later comparison across checkpoints.
-    # -----------------------------------------------------------------------
     output_dir = os.path.join(cfg.output_root, "metrics")
     ensure_dir(output_dir)
-    stem = f"{cfg.dataset}_innovation1_{cfg.degradation_mode}_diagnostic"
+    stem = (
+        f"{cfg.dataset}_innovation1_{cfg.degradation_mode}"
+        f"{_predictor_tag(cfg)}_diagnostic"
+    )
     predictor_csv = os.path.join(output_dir, stem + "_predictor.csv")
     trajectory_csv = os.path.join(output_dir, stem + "_trajectory.csv")
 
@@ -330,8 +323,6 @@ def run_diagnostic(cfg, test_loader, info, device):
 
 
 def main():
-    # Reuse the exact training configuration parser. No new training settings
-    # are introduced by this diagnostic script.
     cfg = parse_args()
     print_config(cfg)
     set_seed(cfg.seed)

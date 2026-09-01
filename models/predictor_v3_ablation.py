@@ -3,6 +3,7 @@
 All variants share exactly the same V3 backbone and parameterization. Only the
 MSI guidance mechanism changes:
 
+- no_msi: keep the complete V3 modules but force MSI transfer to zero.
 - full: fixed MSI high-pass + learned transfer gate + alpha_t=t/T.
 - raw_msi: raw MSI replaces high-pass MSI; gate and alpha_t are retained.
 - hf_nogate: high-pass MSI is injected directly without the learned gate;
@@ -10,8 +11,8 @@ MSI guidance mechanism changes:
 - hf_const: high-pass MSI and the learned gate are retained, but the explicit
   alpha_t=t/T schedule is replaced by alpha_t=1.
 
-The inherited module set is unchanged, so a full-mode model has exactly the
-same state_dict structure as MSIHighFrequencyGuidedPredictor.
+The inherited module set is unchanged, so every mode has exactly the same
+state_dict structure as MSIHighFrequencyGuidedPredictor.
 """
 
 from __future__ import annotations
@@ -22,7 +23,13 @@ import torch.nn.functional as F
 from .predictor_v3 import MSIHighFrequencyGuidedPredictor
 
 
-VALID_MSI_ABLATIONS = ("full", "raw_msi", "hf_nogate", "hf_const")
+VALID_MSI_ABLATIONS = (
+    "no_msi",
+    "full",
+    "raw_msi",
+    "hf_nogate",
+    "hf_const",
+)
 
 
 class MSIAblationGuidedPredictor(MSIHighFrequencyGuidedPredictor):
@@ -39,6 +46,8 @@ class MSIAblationGuidedPredictor(MSIHighFrequencyGuidedPredictor):
         self.msi_ablation = mode
 
     def _inject(self, hsi, msi_feature, gate, time_emb, alpha_t):
+        if self.msi_ablation == "no_msi":
+            return hsi
         if self.msi_ablation == "hf_nogate":
             return hsi + alpha_t * msi_feature
         if self.msi_ablation == "hf_const":
@@ -70,8 +79,9 @@ class MSIAblationGuidedPredictor(MSIHighFrequencyGuidedPredictor):
         time_emb, alpha_t = self._time_embedding(t, x_t.shape[0], x_t.device)
         input_state = x_t
 
-        # Only raw_msi removes the high-pass operation. The encoder, gates,
-        # backbone and parameter count remain identical across all variants.
+        # raw_msi removes only the high-pass operation. no_msi still executes
+        # the same MSI encoder so module/state_dict structure remains identical;
+        # its features are simply bypassed at every transfer point.
         if self.msi_ablation == "raw_msi":
             msi_guidance = hr_msi
         else:

@@ -1,9 +1,9 @@
-"""S2Diff Innovation 1 training / evaluation entry point.
+"""S2Diff training / evaluation entry point.
 
-The predictor receives only x_t and t; HR-MSI is deliberately excluded until
-Innovation 2 is introduced.  predictor_version selects the plain V1 backbone or
-the spectral-spatial EMR-inspired V2 backbone while keeping the diffusion,
-loss, and reverse process unchanged.
+V1 and V2 are HSI-only predictors used to validate Innovation 1. V3 is the
+Innovation 2 predictor, which adds spectrally safer HR-MSI high-frequency
+spatial guidance while keeping the same progressive physical degradation and
+reverse update.
 """
 
 from __future__ import annotations
@@ -15,7 +15,11 @@ import torch
 from config import parse_args, print_config
 from data_loader import build_loaders
 from innovation1 import build_progressive_process, evaluate, train_one_epoch
-from models import CleanHSIPredictor, SpectralSpatialCleanHSIPredictor
+from models import (
+    CleanHSIPredictor,
+    MSIHighFrequencyGuidedPredictor,
+    SpectralSpatialCleanHSIPredictor,
+)
 from utils import (
     CSVLogger,
     count_parameters,
@@ -28,13 +32,14 @@ from utils import (
 
 
 def _predictor_tag(cfg):
-    """Keep legacy V1-64 names while isolating V1 capacity and V2 runs."""
     version = str(getattr(cfg, "predictor_version", "v1")).lower()
     base_channels = int(cfg.predictor_base_channels)
     if version == "v1":
         return "" if base_channels == 64 else f"_bc{base_channels}"
     if version == "v2":
         return "_v2" if base_channels == 64 else f"_v2_bc{base_channels}"
+    if version == "v3":
+        return "_v3" if base_channels == 64 else f"_v3_bc{base_channels}"
     raise ValueError(f"Unsupported predictor_version: {version}")
 
 
@@ -68,6 +73,7 @@ def _build_model(cfg, info, device):
         residual_prediction=True,
     )
     version = str(getattr(cfg, "predictor_version", "v1")).lower()
+
     if version == "v1":
         model = CleanHSIPredictor(**common)
     elif version == "v2":
@@ -75,33 +81,41 @@ def _build_model(cfg, info, device):
             **common,
             spectral_hidden=int(getattr(cfg, "spectral_stem_hidden", 8)),
         )
+    elif version == "v3":
+        model = MSIHighFrequencyGuidedPredictor(
+            **common,
+            n_msi_bands=int(info["n_select_bands"]),
+            spectral_hidden=int(getattr(cfg, "spectral_stem_hidden", 8)),
+            msi_highpass_kernel=int(getattr(cfg, "msi_highpass_kernel", 5)),
+            msi_highpass_sigma=float(getattr(cfg, "msi_highpass_sigma", 1.0)),
+        )
     else:
         raise ValueError(f"Unsupported predictor_version: {version}")
 
     model = model.to(device)
     print(
         f"Predictor version={version}, base_channels={cfg.predictor_base_channels}, "
+        f"requires_msi={bool(getattr(model, 'requires_msi', False))}, "
         f"trainable params={count_parameters(model):.3f} M"
     )
     return model
 
 
 def _format_metrics(metrics):
-    keys = ["PSNR", "SAM", "RMSE", "ERGAS", "SSIM", "CC", "INIT_PSNR", "INIT_SAM"]
-    parts = []
-    for key in keys:
-        if key in metrics:
-            parts.append(f"{key}={metrics[key]:.6f}")
-    return " ".join(parts)
+    keys = [
+        "PSNR", "SAM", "RMSE", "ERGAS", "SSIM", "CC",
+        "INIT_PSNR", "INIT_SAM",
+    ]
+    return " ".join(
+        f"{key}={metrics[key]:.6f}" for key in keys if key in metrics
+    )
 
 
 def run_train(cfg, train_loader, test_loader, info, device):
     process = build_progressive_process(cfg)
     model = _build_model(cfg, info, device)
     optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
+        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
 
     best_path, last_path = _checkpoint_paths(cfg)
@@ -110,10 +124,7 @@ def run_train(cfg, train_loader, test_loader, info, device):
 
     if cfg.resume:
         loaded_epoch, loaded_best = load_checkpoint(
-            model,
-            cfg.resume,
-            optimizer=optimizer,
-            map_location=str(device),
+            model, cfg.resume, optimizer=optimizer, map_location=str(device)
         )
         start_epoch = int(loaded_epoch) + 1
         best_psnr = float(loaded_best)
@@ -124,7 +135,7 @@ def run_train(cfg, train_loader, test_loader, info, device):
 
     transitions = process.transition_timesteps(radius=cfg.boundary_radius)
     print(
-        "Innovation 1 process: "
+        "Progressive process: "
         f"mode={process.operator.mode}, T={process.total_steps}, "
         f"lift={process.default_lift_mode}, transitions={transitions}"
     )
@@ -139,20 +150,9 @@ def run_train(cfg, train_loader, test_loader, info, device):
     logger = CSVLogger(
         log_path,
         fieldnames=[
-            "epoch",
-            "loss",
-            "l1",
-            "sam_loss",
-            "deg_loss",
-            "PSNR",
-            "SAM",
-            "RMSE",
-            "ERGAS",
-            "SSIM",
-            "CC",
-            "INIT_PSNR",
-            "INIT_SAM",
-            "best_PSNR",
+            "epoch", "loss", "l1", "sam_loss", "deg_loss",
+            "PSNR", "SAM", "RMSE", "ERGAS", "SSIM", "CC",
+            "INIT_PSNR", "INIT_SAM", "best_PSNR",
         ],
     )
 
@@ -180,11 +180,7 @@ def run_train(cfg, train_loader, test_loader, info, device):
         metrics = {}
         if epoch % cfg.eval_interval == 0 or epoch == cfg.epochs:
             metrics = evaluate(
-                model,
-                test_loader,
-                process,
-                device,
-                scale_ratio=cfg.scale_ratio,
+                model, test_loader, process, device, scale_ratio=cfg.scale_ratio
             )
             print(f"  eval: {_format_metrics(metrics)}")
 
@@ -255,11 +251,7 @@ def run_test(cfg, test_loader, info, device):
     )
 
     metrics = evaluate(
-        model,
-        test_loader,
-        process,
-        device,
-        scale_ratio=cfg.scale_ratio,
+        model, test_loader, process, device, scale_ratio=cfg.scale_ratio
     )
     print(f"Test metrics: {_format_metrics(metrics)}")
 

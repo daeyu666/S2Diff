@@ -1,17 +1,8 @@
-"""Training and inference engine for Innovation 1.
+"""Training and inference engine for the progressive degradation framework.
 
-Innovation 1 isolates sensor-degradation-consistent progressive diffusion:
-
-    t ~ {1, ..., T}
-    x_t = D~_t(X)
-    X0_hat = F_theta(x_t, t)
-
-and inference starts from the actually observed terminal LR-HSI:
-
-    x_T = U_T(Y_LR)
-    x_{t-1} = x_t + D~_{t-1}(X0_hat) - D~_t(X0_hat)
-
-No MSI enters this module.
+V1/V2 predictors receive only (x_t, t). Innovation 2 V3 declares
+``requires_msi=True`` and receives (x_t, HR-MSI, t). The frozen degradation
+trajectory and reverse update remain identical across all predictor versions.
 """
 
 from __future__ import annotations
@@ -71,13 +62,7 @@ def batch_state_at(
     x: torch.Tensor,
     timesteps: torch.Tensor,
 ) -> torch.Tensor:
-    """Evaluate D~_t(x) for a batch whose samples may use different t.
-
-    ProgressiveDegradation.state_at takes one integer timestep. Grouping by t
-    keeps the implementation vectorized inside each group and, unlike a
-    preallocated in-place scatter, also preserves autograd when this helper is
-    later reused for predicted X0 states.
-    """
+    """Evaluate D~_t(x) for a batch whose samples may use different t."""
     if x.ndim != 4:
         raise ValueError(f"x must be BxCxHxW, got {tuple(x.shape)}")
     if timesteps.ndim != 1 or timesteps.shape[0] != x.shape[0]:
@@ -93,8 +78,7 @@ def batch_state_at(
     outputs = []
     for t_value in torch.unique(t_sorted, sorted=True):
         mask = t_sorted == t_value
-        group = x_sorted[mask]
-        outputs.append(process.state_at(group, int(t_value.item())))
+        outputs.append(process.state_at(x_sorted[mask], int(t_value.item())))
 
     out_sorted = torch.cat(outputs, dim=0)
     return out_sorted.index_select(0, inverse)
@@ -106,12 +90,7 @@ def degradation_consistency_loss(
     target_x0: torch.Tensor,
     timesteps: torch.Tensor,
 ) -> torch.Tensor:
-    """Optional sensor-domain L_deg, disabled by default in first-stage runs.
-
-    Native D_t states have different spatial sizes at different scale stages,
-    so the loss is accumulated per unique timestep instead of concatenating
-    native observations across the batch.
-    """
+    """Optional native-sensor-domain consistency loss."""
     total = pred_x0.new_zeros(())
     batch_size = pred_x0.shape[0]
 
@@ -134,10 +113,8 @@ def _ensure_finite(
     value: torch.Tensor,
     timesteps: Optional[torch.Tensor] = None,
 ) -> None:
-    """Stop immediately at the first numerical failure instead of saving NaNs."""
     if torch.isfinite(value).all():
         return
-
     message = f"Non-finite value detected in {name}"
     if timesteps is not None:
         message += f"; timesteps={timesteps.detach().cpu().tolist()}"
@@ -148,6 +125,20 @@ def _ensure_finite(
             f"; finite_max={finite.max().item():.6e}"
         )
     raise FloatingPointError(message)
+
+
+def model_predict(
+    model: torch.nn.Module,
+    x_t: torch.Tensor,
+    timesteps: torch.Tensor,
+    hr_msi: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Dispatch V1/V2 single-modal or V3 MSI-guided predictor calls."""
+    if bool(getattr(model, "requires_msi", False)):
+        if hr_msi is None:
+            raise ValueError("This predictor requires HR-MSI, but hr_msi is None")
+        return model(x_t, hr_msi, timesteps)
+    return model(x_t, timesteps)
 
 
 def train_one_epoch(
@@ -164,7 +155,7 @@ def train_one_epoch(
     boundary_radius: int = 1,
     grad_clip: float = 1.0,
 ) -> Innovation1TrainStats:
-    """Train F_theta(x_t, t) to directly predict clean HR-HSI X."""
+    """Train the selected predictor to directly estimate clean HR-HSI X."""
     model.train()
     sam_loss_fn = SAMLoss()
 
@@ -174,10 +165,12 @@ def train_one_epoch(
     deg_meter = AverageMeter()
 
     for batch in loader:
-        # Innovation 1 intentionally ignores batch['hr_msi'] and the legacy
-        # batch['lr_hsi']. x_t is synthesized from GT through the exact same
-        # progressive operator used at the terminal observation.
         gt = batch["gt"].to(device, non_blocking=True)
+        hr_msi = None
+        if bool(getattr(model, "requires_msi", False)):
+            hr_msi = batch["hr_msi"].to(device, non_blocking=True)
+            _ensure_finite("hr_msi", hr_msi)
+
         batch_size = gt.shape[0]
         _ensure_finite("gt", gt)
 
@@ -192,7 +185,7 @@ def train_one_epoch(
             x_t = batch_state_at(process, gt, timesteps)
         _ensure_finite("x_t", x_t, timesteps)
 
-        pred_x0 = model(x_t, timesteps)
+        pred_x0 = model_predict(model, x_t, timesteps, hr_msi=hr_msi)
         _ensure_finite("pred_x0", pred_x0, timesteps)
 
         l1 = F.l1_loss(pred_x0, gt)
@@ -201,9 +194,7 @@ def train_one_epoch(
         _ensure_finite("SAM loss", sam, timesteps)
 
         if lambda_deg > 0.0:
-            deg = degradation_consistency_loss(
-                process, pred_x0, gt, timesteps
-            )
+            deg = degradation_consistency_loss(process, pred_x0, gt, timesteps)
             _ensure_finite("degradation consistency loss", deg, timesteps)
         else:
             deg = pred_x0.new_zeros(())
@@ -213,11 +204,11 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-
-        # The previous SAM implementation could create +/-inf gradients while
-        # keeping its forward value finite. error_if_nonfinite makes that class
-        # of failure visible at the exact batch where it occurs.
-        max_norm = float(grad_clip) if grad_clip is not None and grad_clip > 0.0 else float("inf")
+        max_norm = (
+            float(grad_clip)
+            if grad_clip is not None and grad_clip > 0.0
+            else float("inf")
+        )
         torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             max_norm=max_norm,
@@ -245,6 +236,7 @@ def reconstruct_from_terminal_lr(
     lr_hsi: torch.Tensor,
     *,
     target_size: Tuple[int, int],
+    hr_msi: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the fixed deterministic reverse recursion from an LR observation."""
     model.eval()
@@ -252,12 +244,9 @@ def reconstruct_from_terminal_lr(
 
     for t in range(process.total_steps, 0, -1):
         timestep = torch.full(
-            (x_t.shape[0],),
-            t,
-            dtype=torch.long,
-            device=x_t.device,
+            (x_t.shape[0],), t, dtype=torch.long, device=x_t.device
         )
-        pred_x0 = model(x_t, timestep)
+        pred_x0 = model_predict(model, x_t, timestep, hr_msi=hr_msi)
         x_t = process.reverse_update(x_t, pred_x0, t)
 
     return x_t
@@ -272,19 +261,17 @@ def evaluate(
     *,
     scale_ratio: int,
 ) -> Dict[str, float]:
-    """Evaluate the full T->0 reverse process under the selected degradation.
-
-    For synthetic benchmark data the LR observation is regenerated from GT via
-    process.terminal_observation(). This is deliberate: the generic dataset
-    still exposes its historical Gaussian+bicubic lr_hsi field, which must not
-    be used when evaluating the physical-degradation innovation.
-    """
+    """Evaluate the full T->0 reverse process under the selected degradation."""
     model.eval()
     final_meter = MetricAverager()
     init_meter = MetricAverager()
 
     for batch in loader:
         gt = batch["gt"].to(device, non_blocking=True)
+        hr_msi = None
+        if bool(getattr(model, "requires_msi", False)):
+            hr_msi = batch["hr_msi"].to(device, non_blocking=True)
+
         terminal_lr = process.terminal_observation(gt)
         init_state = process.terminal_state(
             terminal_lr, target_size=tuple(gt.shape[-2:])
@@ -294,6 +281,7 @@ def evaluate(
             process,
             terminal_lr,
             target_size=tuple(gt.shape[-2:]),
+            hr_msi=hr_msi,
         )
 
         final_meter.update(calc_metrics(pred, gt, scale_ratio))

@@ -1,4 +1,4 @@
-"""Diagnose Innovation 1 predictor capacity versus reverse-trajectory drift."""
+"""Diagnose predictor capacity and reverse-state drift for V1/V2/V3."""
 
 from __future__ import annotations
 
@@ -12,9 +12,13 @@ import torch
 
 from config import parse_args, print_config
 from data_loader import build_loaders
-from innovation1 import build_progressive_process
+from innovation1 import build_progressive_process, model_predict
 from metrics import MetricAverager, calc_metrics
-from models import CleanHSIPredictor, SpectralSpatialCleanHSIPredictor
+from models import (
+    CleanHSIPredictor,
+    MSIHighFrequencyGuidedPredictor,
+    SpectralSpatialCleanHSIPredictor,
+)
 from utils import count_parameters, ensure_dir, get_device, load_checkpoint, set_seed
 
 
@@ -25,6 +29,8 @@ def _predictor_tag(cfg):
         return "" if base_channels == 64 else f"_bc{base_channels}"
     if version == "v2":
         return "_v2" if base_channels == 64 else f"_v2_bc{base_channels}"
+    if version == "v3":
+        return "_v3" if base_channels == 64 else f"_v3_bc{base_channels}"
     raise ValueError(f"Unsupported predictor_version: {version}")
 
 
@@ -57,14 +63,22 @@ def _build_model(cfg, info, device):
     elif version == "v2":
         model = SpectralSpatialCleanHSIPredictor(
             **common,
-            spectral_hidden=int(getattr(cfg, "spectral_stem_hidden", 8)),
+            spectral_hidden=int(cfg.spectral_stem_hidden),
+        )
+    elif version == "v3":
+        model = MSIHighFrequencyGuidedPredictor(
+            **common,
+            n_msi_bands=int(info["n_select_bands"]),
+            spectral_hidden=int(cfg.spectral_stem_hidden),
+            msi_highpass_kernel=int(cfg.msi_highpass_kernel),
+            msi_highpass_sigma=float(cfg.msi_highpass_sigma),
         )
     else:
         raise ValueError(f"Unsupported predictor_version: {version}")
     model = model.to(device)
     print(
-        f"Predictor version={version}, base_channels={cfg.predictor_base_channels}, "
-        f"trainable params={count_parameters(model):.3f} M"
+        f"Predictor version={version}, params={count_parameters(model):.3f} M, "
+        f"requires_msi={bool(getattr(model, 'requires_msi', False))}"
     )
     return model
 
@@ -72,25 +86,25 @@ def _build_model(cfg, info, device):
 def _range_stats(x: torch.Tensor) -> Dict[str, float]:
     x = x.detach().float()
     total = max(int(x.numel()), 1)
-    below = int((x < 0.0).sum().item())
-    above = int((x > 1.0).sum().item())
     return {
         "min": float(x.min().item()),
         "max": float(x.max().item()),
-        "below0_pct": 100.0 * below / total,
-        "above1_pct": 100.0 * above / total,
+        "below0_pct": 100.0 * int((x < 0.0).sum().item()) / total,
+        "above1_pct": 100.0 * int((x > 1.0).sum().item()) / total,
     }
 
 
 def _mean_dict(rows: List[Dict[str, float]]) -> Dict[str, float]:
     if not rows:
         return {}
-    keys = rows[0].keys()
-    return {key: float(np.mean([row[key] for row in rows])) for key in keys}
+    return {
+        key: float(np.mean([row[key] for row in rows]))
+        for key in rows[0].keys()
+    }
 
 
 def _fmt(value: float) -> str:
-    return "" if value is None else f"{float(value):.6f}"
+    return f"{float(value):.6f}"
 
 
 def run_diagnostic(cfg, test_loader, info, device):
@@ -128,6 +142,9 @@ def run_diagnostic(cfg, test_loader, info, device):
     with torch.no_grad():
         for batch in test_loader:
             gt = batch["gt"].to(device, non_blocking=True)
+            hr_msi = None
+            if bool(getattr(model, "requires_msi", False)):
+                hr_msi = batch["hr_msi"].to(device, non_blocking=True)
             target_size = tuple(gt.shape[-2:])
 
             oracle_states = {}
@@ -137,7 +154,9 @@ def run_diagnostic(cfg, test_loader, info, device):
                 timestep = torch.full(
                     (gt.shape[0],), t, dtype=torch.long, device=device
                 )
-                oracle_pred = model(oracle_state, timestep)
+                oracle_pred = model_predict(
+                    model, oracle_state, timestep, hr_msi=hr_msi
+                )
                 oracle_meters[t].update(
                     calc_metrics(oracle_pred, gt, cfg.scale_ratio)
                 )
@@ -149,7 +168,7 @@ def run_diagnostic(cfg, test_loader, info, device):
             timestep_T = torch.full(
                 (gt.shape[0],), T, dtype=torch.long, device=device
             )
-            one_shot = model(x_t, timestep_T)
+            one_shot = model_predict(model, x_t, timestep_T, hr_msi=hr_msi)
             one_shot_meter.update(calc_metrics(one_shot, gt, cfg.scale_ratio))
 
             reverse_state_meters[T].update(calc_metrics(x_t, gt, cfg.scale_ratio))
@@ -162,7 +181,7 @@ def run_diagnostic(cfg, test_loader, info, device):
                 timestep = torch.full(
                     (gt.shape[0],), t, dtype=torch.long, device=device
                 )
-                pred_x0 = model(x_t, timestep)
+                pred_x0 = model_predict(model, x_t, timestep, hr_msi=hr_msi)
                 reverse_pred_meters[t].update(
                     calc_metrics(pred_x0, gt, cfg.scale_ratio)
                 )
@@ -193,9 +212,9 @@ def run_diagnostic(cfg, test_loader, info, device):
     }
 
     print("\n=== Global comparison ===")
-    print(f"INIT state       : PSNR={init_metrics['PSNR']:.4f} SAM={init_metrics['SAM']:.4f}")
-    print(f"Terminal one-shot: PSNR={one_shot_metrics['PSNR']:.4f} SAM={one_shot_metrics['SAM']:.4f}")
-    print(f"Full reverse     : PSNR={full_metrics['PSNR']:.4f} SAM={full_metrics['SAM']:.4f}")
+    print(f"INIT state        : PSNR={init_metrics['PSNR']:.4f} SAM={init_metrics['SAM']:.4f}")
+    print(f"Terminal one-shot : PSNR={one_shot_metrics['PSNR']:.4f} SAM={one_shot_metrics['SAM']:.4f}")
+    print(f"Full reverse      : PSNR={full_metrics['PSNR']:.4f} SAM={full_metrics['SAM']:.4f}")
     print(
         f"One-shot - full PSNR gap = "
         f"{one_shot_metrics['PSNR'] - full_metrics['PSNR']:.4f} dB"
@@ -208,12 +227,12 @@ def run_diagnostic(cfg, test_loader, info, device):
     )
     for t in range(1, T + 1):
         scale = process.state(t).scale
-        drift = float(np.mean(drift_rows[t]))
         print(
             f"{t:2d} {scale:5d} | "
             f"{oracle_metrics[t]['PSNR']:14.4f} {oracle_metrics[t]['SAM']:13.4f} | "
             f"{reverse_pred_metrics[t]['PSNR']:15.4f} "
-            f"{reverse_pred_metrics[t]['SAM']:14.4f} | {drift:.6e}"
+            f"{reverse_pred_metrics[t]['SAM']:14.4f} | "
+            f"{float(np.mean(drift_rows[t])):.6e}"
         )
 
     print("\n=== Reverse-state trajectory ===")
@@ -221,12 +240,12 @@ def run_diagnostic(cfg, test_loader, info, device):
     for t in range(T, -1, -1):
         scale = process.state(t).scale if t > 0 else 1
         r = _mean_dict(range_rows[t])
-        drift = float(np.mean(drift_rows[t]))
         m = reverse_state_metrics[t]
         print(
             f"{t:2d} {scale:5d} | {m['PSNR']:10.4f} {m['SAM']:9.4f} | "
             f"{r['min']: .5f} {r['max']: .5f} "
-            f"{r['below0_pct']:7.3f} {r['above1_pct']:7.3f} | {drift:.6e}"
+            f"{r['below0_pct']:7.3f} {r['above1_pct']:7.3f} | "
+            f"{float(np.mean(drift_rows[t])):.6e}"
         )
 
     output_dir = os.path.join(cfg.output_root, "metrics")
@@ -258,8 +277,8 @@ def run_diagnostic(cfg, test_loader, info, device):
 
     with open(trajectory_csv, "w", encoding="utf-8", newline="") as f:
         fieldnames = [
-            "t", "scale", "state_psnr", "state_sam", "min", "max",
-            "below0_pct", "above1_pct", "state_drift_l1",
+            "t", "scale", "state_psnr", "state_sam",
+            "min", "max", "below0_pct", "above1_pct", "state_drift_l1",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

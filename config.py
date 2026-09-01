@@ -58,7 +58,7 @@ class TrainConfig:
     spectral_stem_hidden: int = 8
     msi_highpass_kernel: int = 5
     msi_highpass_sigma: float = 1.0
-    # Innovation 2 ablation: full / raw_msi / hf_nogate / hf_const.
+    # Innovation 2 ablation: no_msi / full / raw_msi / hf_nogate / hf_const.
     msi_ablation: str = "full"
 
     epochs: int = 300
@@ -175,9 +175,10 @@ def parse_args(argv: Optional[List[str]] = None):
         "--msi_ablation",
         type=str,
         default="full",
-        choices=["full", "raw_msi", "hf_nogate", "hf_const"],
+        choices=["no_msi", "full", "raw_msi", "hf_nogate", "hf_const"],
         help=(
-            "Innovation 2 ablation: full=HF+gate+t/T; raw_msi=no high-pass; "
+            "Innovation 2 ablation: no_msi=parameter-matched HSI-only; "
+            "full=HF+gate+t/T; raw_msi=no high-pass; "
             "hf_nogate=HF direct injection; hf_const=HF+gate with alpha=1."
         ),
     )

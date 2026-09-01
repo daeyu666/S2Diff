@@ -1,8 +1,9 @@
 """S2Diff Innovation 1 training / evaluation entry point.
 
-This stage evaluates sensor-degradation-consistent progressive diffusion alone.
 The predictor receives only x_t and t; HR-MSI is deliberately excluded until
-Innovation 2 is introduced.
+Innovation 2 is introduced.  predictor_version selects the plain V1 backbone or
+the spectral-spatial EMR-inspired V2 backbone while keeping the diffusion,
+loss, and reverse process unchanged.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import torch
 from config import parse_args, print_config
 from data_loader import build_loaders
 from innovation1 import build_progressive_process, evaluate, train_one_epoch
-from models import CleanHSIPredictor
+from models import CleanHSIPredictor, SpectralSpatialCleanHSIPredictor
 from utils import (
     CSVLogger,
     count_parameters,
@@ -27,9 +28,14 @@ from utils import (
 
 
 def _predictor_tag(cfg):
-    """Keep the original 64-channel baseline name; tag capacity ablations."""
+    """Keep legacy V1-64 names while isolating V1 capacity and V2 runs."""
+    version = str(getattr(cfg, "predictor_version", "v1")).lower()
     base_channels = int(cfg.predictor_base_channels)
-    return "" if base_channels == 64 else f"_bc{base_channels}"
+    if version == "v1":
+        return "" if base_channels == 64 else f"_bc{base_channels}"
+    if version == "v2":
+        return "_v2" if base_channels == 64 else f"_v2_bc{base_channels}"
+    raise ValueError(f"Unsupported predictor_version: {version}")
 
 
 def _checkpoint_paths(cfg):
@@ -53,15 +59,30 @@ def _checkpoint_paths(cfg):
 
 
 def _build_model(cfg, info, device):
-    model = CleanHSIPredictor(
+    common = dict(
         n_bands=int(info["n_bands"]),
         total_steps=int(cfg.diffusion_steps),
         base_channels=int(cfg.predictor_base_channels),
         time_dim=int(cfg.predictor_time_dim),
         dropout=float(cfg.predictor_dropout),
         residual_prediction=True,
-    ).to(device)
-    print(f"Predictor trainable params: {count_parameters(model):.3f} M")
+    )
+    version = str(getattr(cfg, "predictor_version", "v1")).lower()
+    if version == "v1":
+        model = CleanHSIPredictor(**common)
+    elif version == "v2":
+        model = SpectralSpatialCleanHSIPredictor(
+            **common,
+            spectral_hidden=int(getattr(cfg, "spectral_stem_hidden", 8)),
+        )
+    else:
+        raise ValueError(f"Unsupported predictor_version: {version}")
+
+    model = model.to(device)
+    print(
+        f"Predictor version={version}, base_channels={cfg.predictor_base_channels}, "
+        f"trainable params={count_parameters(model):.3f} M"
+    )
     return model
 
 

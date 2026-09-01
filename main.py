@@ -26,6 +26,12 @@ from utils import (
 )
 
 
+def _predictor_tag(cfg):
+    """Keep the original 64-channel baseline name; tag capacity ablations."""
+    base_channels = int(cfg.predictor_base_channels)
+    return "" if base_channels == 64 else f"_bc{base_channels}"
+
+
 def _checkpoint_paths(cfg):
     root = os.path.join(cfg.checkpoint_root, "innovation1")
     ensure_dir(root)
@@ -35,7 +41,10 @@ def _checkpoint_paths(cfg):
         if not filename.endswith(".pth"):
             filename += ".pth"
     else:
-        filename = f"{cfg.dataset}_innovation1_{cfg.degradation_mode}.pth"
+        filename = (
+            f"{cfg.dataset}_innovation1_{cfg.degradation_mode}"
+            f"{_predictor_tag(cfg)}.pth"
+        )
 
     best_path = os.path.join(root, filename)
     stem, ext = os.path.splitext(filename)
@@ -103,7 +112,8 @@ def run_train(cfg, train_loader, test_loader, info, device):
 
     log_path = os.path.join(
         cfg.log_root,
-        f"{cfg.dataset}_innovation1_{cfg.degradation_mode}.csv",
+        f"{cfg.dataset}_innovation1_{cfg.degradation_mode}"
+        f"{_predictor_tag(cfg)}.csv",
     )
     logger = CSVLogger(
         log_path,
@@ -201,6 +211,7 @@ def run_train(cfg, train_loader, test_loader, info, device):
 
     print(f"Training complete. best_PSNR={best_psnr:.6f}")
     print(f"Best checkpoint: {best_path}")
+    print(f"Last checkpoint: {last_path}")
     print(f"Training log: {log_path}")
 
 

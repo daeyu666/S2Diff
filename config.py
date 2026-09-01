@@ -60,9 +60,11 @@ class TrainConfig:
     boundary_radius: int = 1
 
     # --- Innovation 1: predictor ---
+    predictor_version: str = "v1"  # v1 plain U-Net / v2 spectral-spatial EMR-inspired
     predictor_base_channels: int = 64
     predictor_time_dim: int = 256
     predictor_dropout: float = 0.0
+    spectral_stem_hidden: int = 8
 
     # --- 训练 ---
     epochs: int = 300
@@ -96,9 +98,6 @@ class TrainConfig:
     datasets: dict = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# 默认数据集配置
-# ---------------------------------------------------------------------------
 def get_dataset_configs():
     """返回统一实验使用的数据集配置。"""
     return {
@@ -123,25 +122,19 @@ def get_dataset_configs():
     }
 
 
-# ---------------------------------------------------------------------------
-# 命令行参数解析
-# ---------------------------------------------------------------------------
 def parse_args(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
         description="S2Diff Innovation 1: sensor-consistent progressive diffusion"
     )
 
-    # --- 运行控制 ---
     parser.add_argument("--stage", type=str, default="train", choices=["train", "test"])
     parser.add_argument("--dataset", type=str, default="PaviaU")
 
-    # --- 路径 ---
     parser.add_argument("--data_root", type=str, default="./data/raw")
     parser.add_argument("--checkpoint_root", type=str, default="./checkpoints")
     parser.add_argument("--log_root", type=str, default="./logs")
     parser.add_argument("--output_root", type=str, default="./outputs")
 
-    # --- 数据 ---
     parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--patch_size", type=int, default=64)
     parser.add_argument("--stride", type=int, default=32)
@@ -153,26 +146,14 @@ def parse_args(argv: Optional[List[str]] = None):
         help="0 表示使用数据集默认通道数；SRF 模式下由实际 SRF 通道数覆盖。",
     )
 
-    # --- MSI 生成 ---
     parser.add_argument(
-        "--msi_mode",
-        type=str,
-        default="srf",
-        choices=["uniform", "srf"],
+        "--msi_mode", type=str, default="srf", choices=["uniform", "srf"]
     )
-    parser.add_argument(
-        "--srf_path",
-        type=str,
-        default="",
-        help="可选显式 SRF CSV；留空时按数据集和 srf_band_set 自动选择。",
-    )
+    parser.add_argument("--srf_path", type=str, default="")
     parser.add_argument("--wavelength_root", type=str, default="./data/wavelengths")
     parser.add_argument("--wavelength_path", type=str, default="")
     parser.add_argument(
-        "--srf_interp",
-        type=str,
-        default="pchip",
-        choices=["pchip", "linear"],
+        "--srf_interp", type=str, default="pchip", choices=["pchip", "linear"]
     )
     parser.add_argument(
         "--srf_band_set",
@@ -182,7 +163,6 @@ def parse_args(argv: Optional[List[str]] = None):
         help="auto: PaviaU 使用 IKONOS4；Houston13/Chikusei 使用 WV2 all8。",
     )
 
-    # --- Innovation 1: 渐进退化 ---
     parser.add_argument(
         "--degradation_mode",
         type=str,
@@ -203,12 +183,14 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--boundary_probability", type=float, default=0.2)
     parser.add_argument("--boundary_radius", type=int, default=1)
 
-    # --- Innovation 1: predictor ---
+    parser.add_argument(
+        "--predictor_version", type=str, default="v1", choices=["v1", "v2"]
+    )
     parser.add_argument("--predictor_base_channels", type=int, default=64)
     parser.add_argument("--predictor_time_dim", type=int, default=256)
     parser.add_argument("--predictor_dropout", type=float, default=0.0)
+    parser.add_argument("--spectral_stem_hidden", type=int, default=8)
 
-    # --- 训练 ---
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -218,7 +200,6 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
 
-    # --- 损失权重 ---
     parser.add_argument("--lambda_l1", type=float, default=1.0)
     parser.add_argument("--lambda_sam", type=float, default=0.1)
     parser.add_argument("--lambda_deg", type=float, default=0.0)
@@ -229,7 +210,6 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--lambda_srf_region", type=float, default=0.3)
     parser.add_argument("--lambda_mse", type=float, default=1.0)
 
-    # --- 保存 / 恢复 ---
     parser.add_argument("--save_interval", type=int, default=20)
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--resume", type=str, default="")
@@ -254,14 +234,13 @@ def parse_args(argv: Optional[List[str]] = None):
         raise ValueError("boundary_probability must lie in [0, 1]")
     if cfg.lambda_deg < 0.0:
         raise ValueError("lambda_deg must be >= 0")
+    if cfg.spectral_stem_hidden < 2:
+        raise ValueError("spectral_stem_hidden must be >= 2")
 
     make_dirs(cfg)
     return cfg
 
 
-# ---------------------------------------------------------------------------
-# 目录创建
-# ---------------------------------------------------------------------------
 def make_dirs(cfg: TrainConfig):
     dirs = [
         cfg.checkpoint_root,
@@ -275,9 +254,6 @@ def make_dirs(cfg: TrainConfig):
         os.makedirs(path, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# 辅助函数
-# ---------------------------------------------------------------------------
 def get_checkpoint_path(cfg: TrainConfig, stage: str = None, name: str = None):
     stage = stage or cfg.stage
     if name is None or name == "":

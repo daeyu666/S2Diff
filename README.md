@@ -41,12 +41,14 @@ x_{t-1} = x_t + D~_{t-1}(X0_hat) - D~_t(X0_hat)
 | `models/predictor.py` | Innovation 1 时间条件 clean-HSI predictor |
 | `innovation1.py` | 时间步采样、训练、可选 L_deg、完整 T->0 逆推与评估 |
 | `main.py` | Innovation 1 训练 / 测试入口 |
+| `diagnose_innovation1.py` | oracle-state / one-shot / full-reverse predictor诊断 |
 | `data_loader.py` | HSI 数据读取、patch、SRF 协议与通用数据字段 |
-| `losses.py` | 当前提供 SAMLoss |
+| `losses.py` | 当前提供稳定版 SAMLoss |
 | `metrics.py` | PSNR / RMSE / SAM / ERGAS / SSIM / CC |
 | `srf_utils.py` | SRF 读取、插值、权重构建、HSI->MSI |
 | `tests/test_degradation_closure.py` | 退化终点闭合与伴随算子测试 |
 | `tests/test_innovation1_training.py` | predictor / training / reverse inference smoke tests |
+| `tests/test_innovation1_diagnostic.py` | 诊断流程不变量测试 |
 
 ## 固定传感器协议
 
@@ -112,7 +114,7 @@ python main.py \
 
 ## 测试 / 完整逆推
 
-默认读取：
+64-channel 基线默认读取：
 
 ```text
 checkpoints/innovation1/<dataset>_innovation1_<degradation_mode>.pth
@@ -177,11 +179,78 @@ L_deg = ||D_t(X0_hat) - D_t(X)||_1
 
 该损失在原生传感器退化域计算，与 lift 选择解耦。
 
+## Predictor V1.5：纯容量对照
+
+当前 64-channel predictor 在 PaviaU 物理退化下，oracle `t=9` / `t=12` 约为 30.6 / 30.3 dB，且 full reverse 与 oracle 差距很小。下一步先保持全部算法与训练设置不变，只将：
+
+```text
+predictor_base_channels: 64 -> 128
+```
+
+用于判断瓶颈是否主要来自网络容量。
+
+训练 100 epoch：
+
+```bash
+python main.py \
+  --stage train \
+  --dataset PaviaU \
+  --degradation_mode physical \
+  --diffusion_steps 12 \
+  --predictor_base_channels 128 \
+  --epochs 100 \
+  --lambda_l1 1.0 \
+  --lambda_sam 0.1 \
+  --lambda_deg 0.0
+```
+
+128-channel 对照会自动独立保存为：
+
+```text
+checkpoints/innovation1/PaviaU_innovation1_physical_bc128.pth
+checkpoints/innovation1/PaviaU_innovation1_physical_bc128_last.pth
+logs/PaviaU_innovation1_physical_bc128.csv
+```
+
+64-channel 基线命名保持不变，不会被覆盖。
+
+诊断 100 epoch 的 last checkpoint：
+
+```bash
+python diagnose_innovation1.py \
+  --stage test \
+  --dataset PaviaU \
+  --degradation_mode physical \
+  --diffusion_steps 12 \
+  --predictor_base_channels 128 \
+  --resume checkpoints/innovation1/PaviaU_innovation1_physical_bc128_last.pth
+```
+
+诊断输出会独立保存为：
+
+```text
+outputs/metrics/PaviaU_innovation1_physical_bc128_diagnostic_predictor.csv
+outputs/metrics/PaviaU_innovation1_physical_bc128_diagnostic_trajectory.csv
+```
+
+重点比较：
+
+```text
+64ch vs 128ch:
+- oracle t=9 PSNR / SAM
+- oracle t=12 PSNR / SAM
+- terminal one-shot PSNR / SAM
+- full reverse PSNR / SAM
+```
+
+若 128ch 相比 64ch 仅带来很小提升，则下一阶段不继续单纯堆宽度，而转向显式 spectral-spatial predictor V2。
+
 ## 测试
 
 ```bash
 pytest -q tests/test_degradation_closure.py
 pytest -q tests/test_innovation1_training.py
+pytest -q tests/test_innovation1_diagnostic.py
 ```
 
 ## 数据目录

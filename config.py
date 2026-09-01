@@ -7,7 +7,6 @@ from typing import List, Optional
 
 @dataclass
 class DatasetConfig:
-    """单个数据集的配置信息。"""
     name: str
     file_name: str
     mat_keys: list
@@ -16,9 +15,6 @@ class DatasetConfig:
 
 @dataclass
 class TrainConfig:
-    """通用训练配置及Innovation 1实验配置。"""
-
-    # --- 路径 ---
     project_root: str = "."
     data_root: str = "./data/raw"
     cache_root: str = "./data/cache"
@@ -26,21 +22,16 @@ class TrainConfig:
     log_root: str = "./logs"
     output_root: str = "./outputs"
 
-    # --- 运行阶段 ---
     stage: str = "train"
     dataset: str = "PaviaU"
 
-    # --- 数据 ---
     image_size: int = 128
     patch_size: int = 64
     stride: int = 32
     scale_ratio: int = 4
     n_select_bands: int = 4
 
-    # --- MSI 生成模式 ---
-    # 公平对比固定传感器：PaviaU -> IKONOS 4-band；
-    # Houston13 / Chikusei -> WorldView-2 all8。
-    # Innovation 1 predictor 暂不使用 MSI，但保留统一数据协议供后续Innovation 2使用。
+    # Fixed sensor protocols: PaviaU->IKONOS4; Houston13/Chikusei->WV2 all8.
     msi_mode: str = "srf"
     srf_path: str = ""
     wavelength_root: str = "./data/wavelengths"
@@ -48,10 +39,9 @@ class TrainConfig:
     srf_interp: str = "pchip"
     srf_band_set: str = "auto"
 
-    # --- Innovation 1: 渐进退化 ---
-    degradation_mode: str = "physical"  # physical / gaussian_bicubic / bicubic
+    degradation_mode: str = "physical"
     diffusion_steps: int = 12
-    lift_mode: str = "auto"  # physical默认normalized_adjoint，普通退化默认bilinear
+    lift_mode: str = "auto"
     mtf_nyquist: float = 0.2
     psf_truncate: float = 3.0
     gaussian_sigma: float = 2.0
@@ -59,14 +49,16 @@ class TrainConfig:
     boundary_probability: float = 0.2
     boundary_radius: int = 1
 
-    # --- Innovation 1: predictor ---
-    predictor_version: str = "v1"  # v1 plain U-Net / v2 spectral-spatial EMR-inspired
+    # v1: plain HSI U-Net; v2: spectral-spatial HSI-only;
+    # v3: Innovation 2 MSI-high-frequency guided predictor.
+    predictor_version: str = "v1"
     predictor_base_channels: int = 64
     predictor_time_dim: int = 256
     predictor_dropout: float = 0.0
     spectral_stem_hidden: int = 8
+    msi_highpass_kernel: int = 5
+    msi_highpass_sigma: float = 1.0
 
-    # --- 训练 ---
     epochs: int = 300
     batch_size: int = 4
     num_workers: int = 0
@@ -76,10 +68,8 @@ class TrainConfig:
     seed: int = 10
     device: str = "cuda"
 
-    # --- 损失权重 ---
     lambda_l1: float = 1.0
     lambda_sam: float = 0.1
-    # 第一阶段默认关闭；基础模型稳定后可直接设置 >0 启用传感器域退化一致性损失。
     lambda_deg: float = 0.0
     lambda_dc: float = 0.1
     lambda_sgrad: float = 0.05
@@ -88,18 +78,15 @@ class TrainConfig:
     lambda_srf_region: float = 0.3
     lambda_mse: float = 1.0
 
-    # --- 保存 / 恢复 ---
     save_interval: int = 20
     eval_interval: int = 1
     resume: str = ""
     save_name: str = ""
 
-    # --- 数据集注册表 ---
     datasets: dict = field(default_factory=dict)
 
 
 def get_dataset_configs():
-    """返回统一实验使用的数据集配置。"""
     return {
         "PaviaU": DatasetConfig(
             name="PaviaU",
@@ -124,7 +111,7 @@ def get_dataset_configs():
 
 def parse_args(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(
-        description="S2Diff Innovation 1: sensor-consistent progressive diffusion"
+        description="S2Diff progressive physical degradation + MSI guidance"
     )
 
     parser.add_argument("--stage", type=str, default="train", choices=["train", "test"])
@@ -139,28 +126,18 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--patch_size", type=int, default=64)
     parser.add_argument("--stride", type=int, default=32)
     parser.add_argument("--scale_ratio", type=int, default=4)
-    parser.add_argument(
-        "--n_select_bands",
-        type=int,
-        default=0,
-        help="0 表示使用数据集默认通道数；SRF 模式下由实际 SRF 通道数覆盖。",
-    )
+    parser.add_argument("--n_select_bands", type=int, default=0)
 
-    parser.add_argument(
-        "--msi_mode", type=str, default="srf", choices=["uniform", "srf"]
-    )
+    parser.add_argument("--msi_mode", type=str, default="srf", choices=["uniform", "srf"])
     parser.add_argument("--srf_path", type=str, default="")
     parser.add_argument("--wavelength_root", type=str, default="./data/wavelengths")
     parser.add_argument("--wavelength_path", type=str, default="")
-    parser.add_argument(
-        "--srf_interp", type=str, default="pchip", choices=["pchip", "linear"]
-    )
+    parser.add_argument("--srf_interp", type=str, default="pchip", choices=["pchip", "linear"])
     parser.add_argument(
         "--srf_band_set",
         type=str,
         default="auto",
         choices=["auto", "ikonos4", "wv2_visible5", "wv2_visible6", "wv2_all8"],
-        help="auto: PaviaU 使用 IKONOS4；Houston13/Chikusei 使用 WV2 all8。",
     )
 
     parser.add_argument(
@@ -184,12 +161,14 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--boundary_radius", type=int, default=1)
 
     parser.add_argument(
-        "--predictor_version", type=str, default="v1", choices=["v1", "v2"]
+        "--predictor_version", type=str, default="v1", choices=["v1", "v2", "v3"]
     )
     parser.add_argument("--predictor_base_channels", type=int, default=64)
     parser.add_argument("--predictor_time_dim", type=int, default=256)
     parser.add_argument("--predictor_dropout", type=float, default=0.0)
     parser.add_argument("--spectral_stem_hidden", type=int, default=8)
+    parser.add_argument("--msi_highpass_kernel", type=int, default=5)
+    parser.add_argument("--msi_highpass_sigma", type=float, default=1.0)
 
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -216,10 +195,8 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--save_name", type=str, default="")
 
     args = parser.parse_args(argv)
-
     cfg = TrainConfig()
     cfg.datasets = get_dataset_configs()
-
     for key, value in vars(args).items():
         setattr(cfg, key, value)
 
@@ -234,8 +211,10 @@ def parse_args(argv: Optional[List[str]] = None):
         raise ValueError("boundary_probability must lie in [0, 1]")
     if cfg.lambda_deg < 0.0:
         raise ValueError("lambda_deg must be >= 0")
-    if cfg.spectral_stem_hidden < 2:
-        raise ValueError("spectral_stem_hidden must be >= 2")
+    if cfg.msi_highpass_kernel < 3 or cfg.msi_highpass_kernel % 2 == 0:
+        raise ValueError("msi_highpass_kernel must be odd and >= 3")
+    if cfg.msi_highpass_sigma <= 0.0:
+        raise ValueError("msi_highpass_sigma must be > 0")
 
     make_dirs(cfg)
     return cfg
@@ -256,14 +235,14 @@ def make_dirs(cfg: TrainConfig):
 
 def get_checkpoint_path(cfg: TrainConfig, stage: str = None, name: str = None):
     stage = stage or cfg.stage
-    if name is None or name == "":
+    if not name:
         name = f"{cfg.dataset}_{stage}.pth"
     return os.path.join(cfg.checkpoint_root, stage, name)
 
 
 def print_config(cfg: TrainConfig):
     print("=" * 60)
-    print("S2Diff Innovation 1 Config")
+    print("S2Diff Config")
     print("=" * 60)
     for key, value in cfg.__dict__.items():
         if key != "datasets":

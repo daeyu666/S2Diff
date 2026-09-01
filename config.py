@@ -50,7 +50,7 @@ class TrainConfig:
     boundary_radius: int = 1
 
     # v1: plain HSI U-Net; v2: spectral-spatial HSI-only;
-    # v3: Innovation 2 MSI-high-frequency guided predictor.
+    # v3: Innovation 2 MSI-guided predictor.
     predictor_version: str = "v1"
     predictor_base_channels: int = 64
     predictor_time_dim: int = 256
@@ -58,6 +58,8 @@ class TrainConfig:
     spectral_stem_hidden: int = 8
     msi_highpass_kernel: int = 5
     msi_highpass_sigma: float = 1.0
+    # Innovation 2 ablation: full / raw_msi / hf_nogate / hf_const.
+    msi_ablation: str = "full"
 
     epochs: int = 300
     batch_size: int = 4
@@ -169,6 +171,16 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--spectral_stem_hidden", type=int, default=8)
     parser.add_argument("--msi_highpass_kernel", type=int, default=5)
     parser.add_argument("--msi_highpass_sigma", type=float, default=1.0)
+    parser.add_argument(
+        "--msi_ablation",
+        type=str,
+        default="full",
+        choices=["full", "raw_msi", "hf_nogate", "hf_const"],
+        help=(
+            "Innovation 2 ablation: full=HF+gate+t/T; raw_msi=no high-pass; "
+            "hf_nogate=HF direct injection; hf_const=HF+gate with alpha=1."
+        ),
+    )
 
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=4)

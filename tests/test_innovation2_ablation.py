@@ -5,7 +5,7 @@ import torch
 from models import MSIAblationGuidedPredictor
 
 
-MODES = ("full", "raw_msi", "hf_nogate", "hf_const")
+MODES = ("full", "no_msi", "raw_msi", "hf_nogate", "hf_const")
 
 
 def _model(mode):
@@ -75,3 +75,15 @@ def test_hf_const_removes_only_explicit_alpha_schedule():
     # with ones only at the transfer point, leaving the rest of V3 unchanged.
     assert torch.allclose(native_alpha.flatten(), torch.tensor([0.25, 1.0]))
     assert model.msi_ablation == "hf_const"
+
+
+def test_no_msi_is_invariant_to_msi_content_at_initialization():
+    torch.manual_seed(2)
+    model = _model("no_msi")
+    x_t = torch.rand(1, 12, 16, 16)
+    t = torch.tensor([4], dtype=torch.long)
+    msi_a = torch.zeros(1, 4, 16, 16)
+    msi_b = torch.rand(1, 4, 16, 16)
+    pred_a = model(x_t, msi_a, t)
+    pred_b = model(x_t, msi_b, t)
+    assert torch.allclose(pred_a, pred_b, atol=1e-7, rtol=1e-7)

@@ -1,18 +1,26 @@
 """Ablation variants for Innovation 2 MSI guidance.
 
-All variants share exactly the same V3 backbone and parameterization. Only the
-MSI guidance mechanism changes:
+All variants share the same V3 module set and parameterization. Two groups are
+kept for reproducibility:
 
-- no_msi: keep the complete V3 modules but force MSI transfer to zero.
-- full: fixed MSI high-pass + learned transfer gate + alpha_t=t/T.
-- raw_msi: raw MSI replaces high-pass MSI; gate and alpha_t are retained.
-- hf_nogate: high-pass MSI is injected directly without the learned gate;
-  alpha_t=t/T is retained.
-- hf_const: high-pass MSI and the learned gate are retained, but the explicit
-  alpha_t=t/T schedule is replaced by alpha_t=1.
+Legacy group (already trained):
+- no_msi: complete V3 modules, but no MSI feature is transferred.
+- full: high-pass MSI + learned time-conditioned gate + alpha_t=t/T.
+- raw_msi: raw MSI + learned time-conditioned gate + alpha_t=t/T.
+- hf_nogate: high-pass MSI direct injection + alpha_t=t/T.
+- hf_const: high-pass MSI + learned time-conditioned gate + alpha=1.
 
-The inherited module set is unchanged, so every mode has exactly the same
-state_dict structure as MSIHighFrequencyGuidedPredictor.
+Time-free orthogonal group (new):
+- raw_direct: raw MSI, direct injection, no MSI-path time dependence.
+- raw_gate: raw MSI, state-only learned gate, no MSI-path time dependence.
+- hf_direct: high-pass MSI, direct injection, no MSI-path time dependence.
+- hf_gate: high-pass MSI, state-only learned gate, no MSI-path time dependence.
+
+The state-only gate reuses the exact learned gate convolutional modules but
+intentionally bypasses gate.time_proj. Therefore all variants preserve the same
+state_dict structure and total parameter count, while the new group removes
+both the explicit alpha_t=t/T schedule and timestep conditioning inside the MSI
+transfer gate.
 """
 
 from __future__ import annotations
@@ -29,6 +37,17 @@ VALID_MSI_ABLATIONS = (
     "raw_msi",
     "hf_nogate",
     "hf_const",
+    "raw_direct",
+    "raw_gate",
+    "hf_direct",
+    "hf_gate",
+)
+
+TIME_FREE_ABLATIONS = (
+    "raw_direct",
+    "raw_gate",
+    "hf_direct",
+    "hf_gate",
 )
 
 
@@ -45,12 +64,41 @@ class MSIAblationGuidedPredictor(MSIHighFrequencyGuidedPredictor):
             )
         self.msi_ablation = mode
 
+    @staticmethod
+    def _state_only_gate(hsi, msi_feature, gate):
+        """Learn transfer from HSI/MSI state compatibility, without timestep."""
+        if hsi.shape != msi_feature.shape:
+            raise ValueError(
+                f"HSI/MSI feature shapes must match, got {hsi.shape} "
+                f"and {msi_feature.shape}"
+            )
+        logits = gate.gate(
+            torch.cat(
+                [gate.hsi_norm(hsi), gate.msi_norm(msi_feature)],
+                dim=1,
+            )
+        )
+        weight = torch.sigmoid(logits)
+        return hsi + weight * msi_feature
+
     def _inject(self, hsi, msi_feature, gate, time_emb, alpha_t):
-        if self.msi_ablation == "no_msi":
+        mode = self.msi_ablation
+
+        if mode == "no_msi":
             return hsi
-        if self.msi_ablation == "hf_nogate":
+
+        # New fully time-free orthogonal ablations. No t/T multiplier and no
+        # gate.time_proj contribution are used in any of these four modes.
+        if mode in ("raw_direct", "hf_direct"):
+            return hsi + msi_feature
+        if mode in ("raw_gate", "hf_gate"):
+            return self._state_only_gate(hsi, msi_feature, gate)
+
+        # Legacy ablations retained so previous 200-epoch results/checkpoints
+        # remain reproducible.
+        if mode == "hf_nogate":
             return hsi + alpha_t * msi_feature
-        if self.msi_ablation == "hf_const":
+        if mode == "hf_const":
             alpha_t = torch.ones_like(alpha_t)
         return gate(hsi, msi_feature, time_emb, alpha_t)
 
@@ -79,10 +127,9 @@ class MSIAblationGuidedPredictor(MSIHighFrequencyGuidedPredictor):
         time_emb, alpha_t = self._time_embedding(t, x_t.shape[0], x_t.device)
         input_state = x_t
 
-        # raw_msi removes only the high-pass operation. no_msi still executes
-        # the same MSI encoder so module/state_dict structure remains identical;
-        # its features are simply bypassed at every transfer point.
-        if self.msi_ablation == "raw_msi":
+        # Raw/HF selection is orthogonal to Direct/Gate selection in the new
+        # group. Legacy raw_msi keeps its previous behavior.
+        if self.msi_ablation in ("raw_msi", "raw_direct", "raw_gate"):
             msi_guidance = hr_msi
         else:
             msi_guidance = self.msi_highpass(hr_msi)

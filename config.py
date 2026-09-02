@@ -5,6 +5,14 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 
+TIME_FREE_MSI_ABLATIONS = {
+    "raw_direct",
+    "raw_gate",
+    "hf_direct",
+    "hf_gate",
+}
+
+
 @dataclass
 class DatasetConfig:
     name: str
@@ -239,6 +247,17 @@ def parse_args(argv: Optional[List[str]] = None):
         raise ValueError("msi_highpass_kernel must be odd and >= 3")
     if cfg.msi_highpass_sigma <= 0.0:
         raise ValueError("msi_highpass_sigma must be > 0")
+
+    # Innovation-2 ablations must never silently fall back to the HSI-only V1/V2
+    # predictor. This fail-fast guard prevents wasting long training runs when a
+    # CLI argument is dropped by a shell/IDE launch configuration.
+    if cfg.msi_ablation in TIME_FREE_MSI_ABLATIONS and cfg.predictor_version != "v3":
+        raise ValueError(
+            "Innovation 2 ablation "
+            f"{cfg.msi_ablation!r} requires --predictor_version v3, but parsed "
+            f"predictor_version={cfg.predictor_version!r}. Check the actual command "
+            "received by Python before starting training."
+        )
 
     make_dirs(cfg)
     return cfg

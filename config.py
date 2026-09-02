@@ -58,7 +58,7 @@ class TrainConfig:
     spectral_stem_hidden: int = 8
     msi_highpass_kernel: int = 5
     msi_highpass_sigma: float = 1.0
-    # Innovation 2 ablation: no_msi / full / raw_msi / hf_nogate / hf_const.
+    # Legacy modes plus the new fully time-free Raw/HF x Direct/Gate grid.
     msi_ablation: str = "full"
 
     epochs: int = 300
@@ -175,11 +175,22 @@ def parse_args(argv: Optional[List[str]] = None):
         "--msi_ablation",
         type=str,
         default="full",
-        choices=["no_msi", "full", "raw_msi", "hf_nogate", "hf_const"],
+        choices=[
+            "no_msi",
+            "full",
+            "raw_msi",
+            "hf_nogate",
+            "hf_const",
+            "raw_direct",
+            "raw_gate",
+            "hf_direct",
+            "hf_gate",
+        ],
         help=(
-            "Innovation 2 ablation: no_msi=parameter-matched HSI-only; "
-            "full=HF+gate+t/T; raw_msi=no high-pass; "
-            "hf_nogate=HF direct injection; hf_const=HF+gate with alpha=1."
+            "Legacy: no_msi/full/raw_msi/hf_nogate/hf_const. "
+            "Time-free orthogonal grid: raw_direct/raw_gate/hf_direct/hf_gate; "
+            "the new grid uses alpha=1 and removes timestep conditioning from "
+            "the MSI transfer gate."
         ),
     )
 

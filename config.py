@@ -11,6 +11,7 @@ TIME_FREE_MSI_ABLATIONS = {
     "hf_direct",
     "hf_gate",
     "raw_translate",
+    "raw_translate_ctx",
 }
 
 
@@ -67,7 +68,7 @@ class TrainConfig:
     spectral_stem_hidden: int = 8
     msi_highpass_kernel: int = 5
     msi_highpass_sigma: float = 1.0
-    # Legacy modes, time-free Raw/HF x Direct/Gate grid, and raw translation.
+    # Legacy modes, time-free Raw/HF grid, and raw translation candidates.
     msi_ablation: str = "full"
 
     epochs: int = 300
@@ -195,13 +196,16 @@ def parse_args(argv: Optional[List[str]] = None):
             "hf_direct",
             "hf_gate",
             "raw_translate",
+            "raw_translate_ctx",
         ],
         help=(
             "Legacy: no_msi/full/raw_msi/hf_nogate/hf_const. "
             "Time-free grid: raw_direct/raw_gate/hf_direct/hf_gate. "
-            "Translation candidate: raw_translate = complete raw MSI + "
-            "identity-initialized low-rank residual translation + direct injection; "
-            "no high-pass, transfer gate, or MSI-path timestep conditioning."
+            "Translation: raw_translate = MSI-only low-rank residual translation; "
+            "raw_translate_ctx = same idea conditioned on the current same-scale "
+            "HSI restoration feature. Translation modes use complete raw MSI, "
+            "direct injection, no high-pass, no transfer gate, and no MSI-path "
+            "timestep conditioning."
         ),
     )
 

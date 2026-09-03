@@ -201,6 +201,18 @@ def test_raw_translate_ctx_full_model_starts_from_raw_direct_mapping():
     torch.manual_seed(8)
     raw_translate_ctx = _model("raw_translate_ctx")
 
+    # The production output head is zero-initialized, which would make every
+    # model trivially return x_t. Open the shared output head identically so
+    # this test actually probes equality of the internal feature mapping.
+    torch.manual_seed(9)
+    shared_weight = torch.randn_like(raw_direct.out_conv.weight) * 0.01
+    shared_bias = torch.randn_like(raw_direct.out_conv.bias) * 0.01
+    with torch.no_grad():
+        raw_direct.out_conv.weight.copy_(shared_weight)
+        raw_direct.out_conv.bias.copy_(shared_bias)
+        raw_translate_ctx.out_conv.weight.copy_(shared_weight)
+        raw_translate_ctx.out_conv.bias.copy_(shared_bias)
+
     pred_direct = raw_direct(x_t, msi, t)
     pred_ctx = raw_translate_ctx(x_t, msi, t)
     assert torch.allclose(pred_direct, pred_ctx, atol=1e-7, rtol=1e-7)

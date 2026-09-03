@@ -1,11 +1,12 @@
-"""Dedicated launcher for Innovation 2 time-free MSI ablations.
+"""Dedicated launcher for Innovation 2 MSI experiments.
 
-This wrapper forces predictor_version=v3 so an ablation run cannot silently
+This wrapper forces predictor_version=v3 so an MSI experiment cannot silently
 fall back to the HSI-only V1 predictor. All other CLI arguments are forwarded
 to main.py unchanged.
 
-Example:
+Examples:
     python train_innovation2_ablation.py --msi_ablation raw_direct --epochs 200
+    python train_innovation2_ablation.py --msi_ablation raw_translate --epochs 200
 """
 
 from __future__ import annotations
@@ -15,7 +16,13 @@ import sys
 from main import main
 
 
-TIME_FREE_MODES = {"raw_direct", "raw_gate", "hf_direct", "hf_gate"}
+TIME_FREE_MODES = {
+    "raw_direct",
+    "raw_gate",
+    "hf_direct",
+    "hf_gate",
+    "raw_translate",
+}
 
 
 def _value_after(args, flag):
@@ -38,7 +45,7 @@ def _prepare_argv():
         )
     if requested not in TIME_FREE_MODES:
         raise SystemExit(
-            f"This launcher is for the time-free orthogonal ablation grid; "
+            f"This launcher is for the time-free MSI experiment set; "
             f"got msi_ablation={requested!r}. Expected one of "
             f"{sorted(TIME_FREE_MODES)}"
         )

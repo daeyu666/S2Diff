@@ -10,6 +10,7 @@ TIME_FREE_MSI_ABLATIONS = {
     "raw_gate",
     "hf_direct",
     "hf_gate",
+    "raw_translate",
 }
 
 
@@ -58,7 +59,7 @@ class TrainConfig:
     boundary_radius: int = 1
 
     # v1: plain HSI U-Net; v2: spectral-spatial HSI-only;
-    # v3: Innovation 2 MSI-guided predictor.
+    # v3: MSI-guided/translation predictor experiments.
     predictor_version: str = "v1"
     predictor_base_channels: int = 64
     predictor_time_dim: int = 256
@@ -66,7 +67,7 @@ class TrainConfig:
     spectral_stem_hidden: int = 8
     msi_highpass_kernel: int = 5
     msi_highpass_sigma: float = 1.0
-    # Legacy modes plus the new fully time-free Raw/HF x Direct/Gate grid.
+    # Legacy modes, time-free Raw/HF x Direct/Gate grid, and raw translation.
     msi_ablation: str = "full"
 
     epochs: int = 300
@@ -193,12 +194,14 @@ def parse_args(argv: Optional[List[str]] = None):
             "raw_gate",
             "hf_direct",
             "hf_gate",
+            "raw_translate",
         ],
         help=(
             "Legacy: no_msi/full/raw_msi/hf_nogate/hf_const. "
-            "Time-free orthogonal grid: raw_direct/raw_gate/hf_direct/hf_gate; "
-            "the new grid uses alpha=1 and removes timestep conditioning from "
-            "the MSI transfer gate."
+            "Time-free grid: raw_direct/raw_gate/hf_direct/hf_gate. "
+            "Translation candidate: raw_translate = complete raw MSI + "
+            "identity-initialized low-rank residual translation + direct injection; "
+            "no high-pass, transfer gate, or MSI-path timestep conditioning."
         ),
     )
 
@@ -248,12 +251,12 @@ def parse_args(argv: Optional[List[str]] = None):
     if cfg.msi_highpass_sigma <= 0.0:
         raise ValueError("msi_highpass_sigma must be > 0")
 
-    # Innovation-2 ablations must never silently fall back to the HSI-only V1/V2
-    # predictor. This fail-fast guard prevents wasting long training runs when a
-    # CLI argument is dropped by a shell/IDE launch configuration.
+    # Innovation-2 MSI experiments must never silently fall back to the HSI-only
+    # V1/V2 predictor. This fail-fast guard prevents wasting long training runs
+    # when a CLI argument is dropped by a shell/IDE launch configuration.
     if cfg.msi_ablation in TIME_FREE_MSI_ABLATIONS and cfg.predictor_version != "v3":
         raise ValueError(
-            "Innovation 2 ablation "
+            "Innovation 2 experiment "
             f"{cfg.msi_ablation!r} requires --predictor_version v3, but parsed "
             f"predictor_version={cfg.predictor_version!r}. Check the actual command "
             "received by Python before starting training."

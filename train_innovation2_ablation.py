@@ -7,6 +7,7 @@ to main.py unchanged.
 Examples:
     python train_innovation2_ablation.py --msi_ablation raw_direct --epochs 200
     python train_innovation2_ablation.py --msi_ablation raw_translate --epochs 200
+    python train_innovation2_ablation.py --msi_ablation raw_translate_ctx --epochs 200
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ TIME_FREE_MODES = {
     "hf_direct",
     "hf_gate",
     "raw_translate",
+    "raw_translate_ctx",
 }
 
 

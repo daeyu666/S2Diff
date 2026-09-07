@@ -69,6 +69,12 @@ class TrainConfig:
     # Legacy modes plus the new fully time-free Raw/HF x Direct/Gate grid.
     msi_ablation: str = "full"
 
+    # Baseline-2 non-registration augmentation. This intentionally perturbs
+    # only HR-MSI during training; GT/LR-HSI/Innovation-1 trajectory stay fixed.
+    train_msi_translation_max_px: float = 0.0
+    train_msi_translation_probability: float = 1.0
+    train_misalignment_seed_offset: int = 7919
+
     epochs: int = 300
     batch_size: int = 4
     num_workers: int = 0
@@ -201,6 +207,27 @@ def parse_args(argv: Optional[List[str]] = None):
             "the MSI transfer gate."
         ),
     )
+    parser.add_argument(
+        "--train_msi_translation_max_px",
+        type=float,
+        default=0.0,
+        help=(
+            "Baseline-2 training augmentation: dx,dy are sampled independently "
+            "from U(-d,d) and applied only to HR-MSI. 0 disables augmentation."
+        ),
+    )
+    parser.add_argument(
+        "--train_msi_translation_probability",
+        type=float,
+        default=1.0,
+        help="Per-sample probability of applying training MSI translation.",
+    )
+    parser.add_argument(
+        "--train_misalignment_seed_offset",
+        type=int,
+        default=7919,
+        help="Offset added to --seed for the independent training-warp RNG.",
+    )
 
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -247,6 +274,10 @@ def parse_args(argv: Optional[List[str]] = None):
         raise ValueError("msi_highpass_kernel must be odd and >= 3")
     if cfg.msi_highpass_sigma <= 0.0:
         raise ValueError("msi_highpass_sigma must be > 0")
+    if cfg.train_msi_translation_max_px < 0.0:
+        raise ValueError("train_msi_translation_max_px must be >= 0")
+    if not 0.0 <= cfg.train_msi_translation_probability <= 1.0:
+        raise ValueError("train_msi_translation_probability must lie in [0,1]")
 
     # Innovation-2 ablations must never silently fall back to the HSI-only V1/V2
     # predictor. This fail-fast guard prevents wasting long training runs when a
@@ -258,6 +289,15 @@ def parse_args(argv: Optional[List[str]] = None):
             f"predictor_version={cfg.predictor_version!r}. Check the actual command "
             "received by Python before starting training."
         )
+
+    # Baseline 2 is deliberately defined on the frozen Raw-Direct model so its
+    # gain measures data augmentation alone, without mixing in a new MSI module.
+    if cfg.train_msi_translation_max_px > 0.0:
+        if cfg.predictor_version != "v3" or cfg.msi_ablation != "raw_direct":
+            raise ValueError(
+                "Training MSI translation augmentation is the Raw-Direct Baseline 2; "
+                "use --predictor_version v3 --msi_ablation raw_direct."
+            )
 
     make_dirs(cfg)
     return cfg

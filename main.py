@@ -31,6 +31,11 @@ from utils import (
 )
 
 
+def _compact_float_tag(value: float) -> str:
+    text = f"{float(value):g}"
+    return text.replace("-", "m").replace(".", "p")
+
+
 def _predictor_tag(cfg):
     version = str(getattr(cfg, "predictor_version", "v1")).lower()
     base_channels = int(cfg.predictor_base_channels)
@@ -42,7 +47,14 @@ def _predictor_tag(cfg):
         ablation = str(getattr(cfg, "msi_ablation", "full")).lower()
         mode_tag = "" if ablation == "full" else f"_{ablation}"
         width_tag = "" if base_channels == 64 else f"_bc{base_channels}"
-        return f"_v3{mode_tag}{width_tag}"
+        train_shift = float(getattr(cfg, "train_msi_translation_max_px", 0.0))
+        train_prob = float(getattr(cfg, "train_msi_translation_probability", 1.0))
+        aug_tag = ""
+        if train_shift > 0.0:
+            aug_tag = f"_traug{_compact_float_tag(train_shift)}"
+            if abs(train_prob - 1.0) > 1e-12:
+                aug_tag += f"_p{_compact_float_tag(train_prob)}"
+        return f"_v3{mode_tag}{width_tag}{aug_tag}"
     raise ValueError(f"Unsupported predictor_version: {version}")
 
 
@@ -148,6 +160,20 @@ def run_train(cfg, train_loader, test_loader, info, device):
     if hasattr(process.operator, "extra_repr"):
         print(f"Degradation operator: {process.operator.extra_repr()}")
 
+    train_shift = float(getattr(cfg, "train_msi_translation_max_px", 0.0))
+    train_prob = float(getattr(cfg, "train_msi_translation_probability", 1.0))
+    warp_generator = None
+    if train_shift > 0.0:
+        warp_seed = int(cfg.seed) + int(getattr(cfg, "train_misalignment_seed_offset", 7919))
+        warp_generator = torch.Generator(device="cpu")
+        warp_generator.manual_seed(warp_seed)
+        print(
+            "Training MSI misalignment augmentation: "
+            f"translation-only dx,dy~U(-{train_shift:g},{train_shift:g}) px, "
+            f"probability={train_prob:.3f}, warp_seed={warp_seed}. "
+            "GT/LR-HSI remain registered."
+        )
+
     log_path = os.path.join(
         cfg.log_root,
         f"{cfg.dataset}_innovation1_{cfg.degradation_mode}"
@@ -156,7 +182,7 @@ def run_train(cfg, train_loader, test_loader, info, device):
     logger = CSVLogger(
         log_path,
         fieldnames=[
-            "epoch", "loss", "l1", "sam_loss", "deg_loss",
+            "epoch", "loss", "l1", "sam_loss", "deg_loss", "msi_shift_px",
             "PSNR", "SAM", "RMSE", "ERGAS", "SSIM", "CC",
             "INIT_PSNR", "INIT_SAM", "best_PSNR",
         ],
@@ -175,12 +201,16 @@ def run_train(cfg, train_loader, test_loader, info, device):
             boundary_probability=cfg.boundary_probability,
             boundary_radius=cfg.boundary_radius,
             grad_clip=cfg.grad_clip,
+            msi_translation_max_px=train_shift,
+            msi_translation_probability=train_prob,
+            msi_misalignment_generator=warp_generator,
         )
 
         print(
             f"Epoch {epoch:04d}/{cfg.epochs:04d} "
             f"loss={stats.loss:.6f} l1={stats.l1:.6f} "
-            f"sam={stats.sam:.6f} deg={stats.deg:.6f}"
+            f"sam={stats.sam:.6f} deg={stats.deg:.6f} "
+            f"msi_shift={stats.msi_shift:.4f}px"
         )
 
         metrics = {}
@@ -188,7 +218,10 @@ def run_train(cfg, train_loader, test_loader, info, device):
             metrics = evaluate(
                 model, test_loader, process, device, scale_ratio=cfg.scale_ratio
             )
-            print(f"  eval: {_format_metrics(metrics)}")
+            if train_shift > 0.0:
+                print(f"  registered eval: {_format_metrics(metrics)}")
+            else:
+                print(f"  eval: {_format_metrics(metrics)}")
 
             psnr = float(metrics["PSNR"])
             if psnr > best_psnr:
@@ -210,6 +243,7 @@ def run_train(cfg, train_loader, test_loader, info, device):
                 "l1": stats.l1,
                 "sam_loss": stats.sam,
                 "deg_loss": stats.deg,
+                "msi_shift_px": stats.msi_shift,
                 "PSNR": metrics.get("PSNR", ""),
                 "SAM": metrics.get("SAM", ""),
                 "RMSE": metrics.get("RMSE", ""),
@@ -232,8 +266,8 @@ def run_train(cfg, train_loader, test_loader, info, device):
                 extra={"config": vars(cfg), "metrics": metrics},
             )
 
-    print(f"Training complete. best_PSNR={best_psnr:.6f}")
-    print(f"Best checkpoint: {best_path}")
+    print(f"Training complete. best_registered_PSNR={best_psnr:.6f}")
+    print(f"Best registered-eval checkpoint: {best_path}")
     print(f"Last checkpoint: {last_path}")
     print(f"Training log: {log_path}")
 

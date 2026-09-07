@@ -7,6 +7,15 @@ from typing import Any
 from .base import BaseDegradation
 from .bicubic import BicubicDegradation
 from .gaussian_bicubic import GaussianBicubicDegradation
+from .misalignment import (
+    MisalignmentParameters,
+    apply_misalignment,
+    build_global_grid,
+    build_local_grid,
+    generate_smooth_local_displacement,
+    make_misaligned_msi,
+    sample_misalignment_parameters,
+)
 from .physical import PhysicalDegradation, sigma_from_mtf_nyquist
 from .progressive import ProgressiveDegradation, ProgressiveState
 
@@ -45,6 +54,13 @@ __all__ = [
     "PhysicalDegradation",
     "ProgressiveDegradation",
     "ProgressiveState",
+    "MisalignmentParameters",
+    "apply_misalignment",
     "build_degradation",
+    "build_global_grid",
+    "build_local_grid",
+    "generate_smooth_local_displacement",
+    "make_misaligned_msi",
+    "sample_misalignment_parameters",
     "sigma_from_mtf_nyquist",
 ]

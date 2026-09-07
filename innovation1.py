@@ -13,7 +13,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from degradations import ProgressiveDegradation, build_degradation
+from degradations import ProgressiveDegradation, build_degradation, make_misaligned_msi
 from losses import SAMLoss
 from metrics import MetricAverager, calc_metrics
 from utils import AverageMeter
@@ -25,6 +25,7 @@ class Innovation1TrainStats:
     l1: float
     sam: float
     deg: float
+    msi_shift: float = 0.0
 
 
 def build_progressive_process(cfg) -> ProgressiveDegradation:
@@ -141,6 +142,59 @@ def model_predict(
     return model(x_t, timesteps)
 
 
+def augment_training_msi_translation(
+    hr_msi: torch.Tensor,
+    *,
+    max_shift_px: float,
+    probability: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, float]:
+    """Apply translation-only MSI misalignment augmentation to a training batch.
+
+    Only HR-MSI is changed. GT, LR-HSI and the progressive HSI state remain
+    untouched. Offsets are continuous and sampled independently per sample as
+    dx,dy ~ U(-max_shift_px, max_shift_px). The returned scalar is the mean
+    effective translation magnitude over the whole batch and is logged so a
+    misalignment run cannot silently fall back to registered training.
+    """
+    max_shift = float(max_shift_px)
+    prob = float(probability)
+    if max_shift < 0.0:
+        raise ValueError("max_shift_px must be >= 0")
+    if not 0.0 <= prob <= 1.0:
+        raise ValueError("probability must lie in [0,1]")
+    if max_shift == 0.0 or prob == 0.0:
+        return hr_msi, 0.0
+
+    warped, _, params = make_misaligned_msi(
+        hr_msi,
+        translation_max_px=max_shift,
+        rotation_max_deg=0.0,
+        local_max_displacement_px=0.0,
+        generator=generator,
+    )
+    magnitude = torch.sqrt(params.dx_px.square() + params.dy_px.square())
+
+    if prob < 1.0:
+        use_aug = torch.rand(
+            hr_msi.shape[0],
+            generator=generator,
+            device="cpu",
+            dtype=torch.float32,
+        ) < prob
+        use_aug_device = use_aug.to(device=hr_msi.device)
+        hr_msi = torch.where(
+            use_aug_device[:, None, None, None],
+            warped,
+            hr_msi,
+        )
+        magnitude = magnitude * use_aug_device.to(dtype=magnitude.dtype)
+    else:
+        hr_msi = warped
+
+    return hr_msi, float(magnitude.mean().item())
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     loader,
@@ -154,6 +208,9 @@ def train_one_epoch(
     boundary_probability: float = 0.2,
     boundary_radius: int = 1,
     grad_clip: float = 1.0,
+    msi_translation_max_px: float = 0.0,
+    msi_translation_probability: float = 1.0,
+    msi_misalignment_generator: Optional[torch.Generator] = None,
 ) -> Innovation1TrainStats:
     """Train the selected predictor to directly estimate clean HR-HSI X."""
     model.train()
@@ -163,6 +220,7 @@ def train_one_epoch(
     l1_meter = AverageMeter()
     sam_meter = AverageMeter()
     deg_meter = AverageMeter()
+    shift_meter = AverageMeter()
 
     for batch in loader:
         gt = batch["gt"].to(device, non_blocking=True)
@@ -170,8 +228,18 @@ def train_one_epoch(
         if bool(getattr(model, "requires_msi", False)):
             hr_msi = batch["hr_msi"].to(device, non_blocking=True)
             _ensure_finite("hr_msi", hr_msi)
+            hr_msi, mean_shift = augment_training_msi_translation(
+                hr_msi,
+                max_shift_px=msi_translation_max_px,
+                probability=msi_translation_probability,
+                generator=msi_misalignment_generator,
+            )
+            _ensure_finite("augmented_hr_msi", hr_msi)
+        else:
+            mean_shift = 0.0
 
         batch_size = gt.shape[0]
+        shift_meter.update(mean_shift, batch_size)
         _ensure_finite("gt", gt)
 
         timesteps = process.sample_timesteps(
@@ -226,6 +294,7 @@ def train_one_epoch(
         l1=l1_meter.avg,
         sam=sam_meter.avg,
         deg=deg_meter.avg,
+        msi_shift=shift_meter.avg,
     )
 
 

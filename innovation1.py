@@ -152,10 +152,12 @@ def augment_training_msi_translation(
     """Apply translation-only MSI misalignment augmentation to a training batch.
 
     Only HR-MSI is changed. GT, LR-HSI and the progressive HSI state remain
-    untouched. Offsets are continuous and sampled independently per sample as
-    dx,dy ~ U(-max_shift_px, max_shift_px). The returned scalar is the mean
-    effective translation magnitude over the whole batch and is logged so a
-    misalignment run cannot silently fall back to registered training.
+    untouched. IMPORTANT: ``max_shift_px=d`` is the maximum Euclidean 2-D
+    displacement. The shared sampler uses r~U(0,d), theta~U(0,2pi), then
+    dx=r*cos(theta), dy=r*sin(theta), so sqrt(dx^2+dy^2)<=d for every sample.
+    The returned scalar is the mean effective translation magnitude over the
+    whole batch and is logged so a misalignment run cannot silently fall back
+    to registered training.
     """
     max_shift = float(max_shift_px)
     prob = float(probability)

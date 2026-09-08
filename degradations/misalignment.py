@@ -1,8 +1,8 @@
 """Reusable synthetic HSI-MSI misalignment degradation.
 
 Only the HR-MSI observation is warped. HR-HSI ground truth and LR-HSI remain
-unchanged. The module supports the four protocols used by the current study:
-registered, global-only, local-only and global+local.
+unchanged. The module supports registered, global-only, local-only and
+combined global+local protocols.
 
 Global deformation contains translation and small-angle rotation. Local
 non-rigid deformation is generated on a coarse control grid and bicubically
@@ -11,6 +11,21 @@ applied to an all-one image to obtain a soft validity mask.
 
 All spatial transforms use continuous coordinates and bilinear sampling, so
 sub-pixel misregistration is represented explicitly.
+
+IMPORTANT TRANSLATION-SEVERITY DEFINITION
+----------------------------------------
+``translation_max_px = d`` means the Euclidean magnitude of the global
+translation is bounded by d pixels:
+
+    r ~ U(0, d), theta ~ U(0, 2*pi)
+    dx = r*cos(theta), dy = r*sin(theta)
+    sqrt(dx^2 + dy^2) = r <= d
+
+This replaces the older independent-axis definition dx,dy~U(-d,d), whose
+actual 2-D displacement could reach sqrt(2)*d.  Keeping the random radius and
+direction normalized also makes paired severity sweeps geometrically clean:
+using the same seed at d=0.5/1/2/... reuses the same normalized radius and
+direction and only scales the displacement magnitude.
 """
 
 from __future__ import annotations
@@ -87,11 +102,9 @@ def build_global_grid(
     cos_a = torch.cos(angle)
     sin_a = torch.sin(angle)
 
-    # Desired forward translation in normalized image coordinates.
     tx = 2.0 * dx / float(width)
     ty = 2.0 * dy / float(height)
 
-    # Inverse of y = R(a) x + t is x = R(-a) y - R(-a) t.
     theta = torch.zeros(batch_size, 2, 3, device=device, dtype=dtype)
     theta[:, 0, 0] = cos_a
     theta[:, 0, 1] = sin_a
@@ -135,8 +148,6 @@ def generate_smooth_local_displacement(
             batch_size, 2, height, width, device=device, dtype=dtype
         )
 
-    # Sample on CPU so a normal CPU torch.Generator can be reused regardless
-    # of whether inference runs on CPU or CUDA.
     controls = torch.rand(
         batch_size,
         2,
@@ -147,7 +158,6 @@ def generate_smooth_local_displacement(
         dtype=torch.float32,
     ) * 2.0 - 1.0
 
-    # Bound each coarse displacement vector to the unit disk.
     norm = torch.linalg.vector_norm(controls, dim=1, keepdim=True).clamp_min(1e-8)
     controls = controls / torch.maximum(norm, torch.ones_like(norm))
     controls = controls * max_disp
@@ -160,8 +170,6 @@ def generate_smooth_local_displacement(
         align_corners=True,
     )
 
-    # Bicubic interpolation may overshoot near control points. Re-project the
-    # dense field onto the requested displacement ball.
     dense_norm = torch.linalg.vector_norm(dense, dim=1, keepdim=True).clamp_min(1e-8)
     scale = torch.clamp(max_disp / dense_norm, max=1.0)
     return dense * scale
@@ -185,8 +193,6 @@ def build_local_grid(local_displacement_px: torch.Tensor) -> torch.Tensor:
     dx = local_displacement_px[:, 0]
     dy = local_displacement_px[:, 1]
     grid = base.clone()
-    # Source = output - displacement, so positive displacement moves content
-    # right/down in the warped image.
     grid[..., 0] = grid[..., 0] - 2.0 * dx / float(width)
     grid[..., 1] = grid[..., 1] - 2.0 * dy / float(height)
     return grid
@@ -217,27 +223,36 @@ def sample_misalignment_parameters(
 ) -> MisalignmentParameters:
     """Sample one batch of global and local perturbation parameters.
 
-    Global parameters follow
-      dx,dy ~ U(-translation_max_px, translation_max_px)
-      angle ~ U(-rotation_max_deg, rotation_max_deg).
+    ``translation_max_px=d`` is the *maximum Euclidean translation magnitude*,
+    not an independent x/y bound:
+
+      radius ~ U(0, d)
+      theta  ~ U(0, 2*pi)
+      dx = radius*cos(theta), dy = radius*sin(theta)
+
+    Hence sqrt(dx^2+dy^2) <= d for every sample. Rotation remains
+    U(-rotation_max_deg, rotation_max_deg).
     """
     tmax = float(translation_max_px)
     rmax = float(rotation_max_deg)
     if tmax < 0.0 or rmax < 0.0:
         raise ValueError("translation/rotation maxima must be >= 0")
 
-    # Always draw unit global variables, even when a maximum is zero. This
-    # keeps RNG consumption identical across paired severity sweeps.
+    # Always consume three unit random variables, even when a maximum is zero.
+    # This preserves deterministic paired severity sweeps.  Across d values,
+    # the same seed reuses the same normalized radius, direction and rotation.
     unit = torch.rand(
         batch_size,
         3,
         generator=generator,
         device="cpu",
         dtype=torch.float32,
-    ) * 2.0 - 1.0
-    dx = (unit[:, 0] * tmax).to(device=device, dtype=dtype)
-    dy = (unit[:, 1] * tmax).to(device=device, dtype=dtype)
-    angle = (unit[:, 2] * rmax).to(device=device, dtype=dtype)
+    )
+    radius = unit[:, 0] * tmax
+    theta = unit[:, 1] * (2.0 * torch.pi)
+    dx = (radius * torch.cos(theta)).to(device=device, dtype=dtype)
+    dy = (radius * torch.sin(theta)).to(device=device, dtype=dtype)
+    angle = ((unit[:, 2] * 2.0 - 1.0) * rmax).to(device=device, dtype=dtype)
 
     local = generate_smooth_local_displacement(
         batch_size,
@@ -256,12 +271,7 @@ def apply_misalignment(
     hr_msi: torch.Tensor,
     params: MisalignmentParameters,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply global then local warp and return warped MSI + soft validity mask.
-
-    The returned validity mask is produced by applying the exact same sequence
-    of warps to an all-one image. It is therefore suitable for valid-overlap
-    evaluation after thresholding, e.g. ``valid_soft >= 0.999``.
-    """
+    """Apply global then local warp and return warped MSI + soft validity mask."""
     if hr_msi.ndim != 4:
         raise ValueError(f"hr_msi must be BxCxHxW, got {tuple(hr_msi.shape)}")
     batch_size, _, height, width = hr_msi.shape
@@ -314,7 +324,7 @@ def make_misaligned_msi(
     control_grid_size: int = 5,
     generator: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, MisalignmentParameters]:
-    """Convenience wrapper: sample perturbations, warp MSI and return mask."""
+    """Sample perturbations, warp MSI and return mask + parameters."""
     if hr_msi.ndim != 4:
         raise ValueError(f"hr_msi must be BxCxHxW, got {tuple(hr_msi.shape)}")
     batch_size, _, height, width = hr_msi.shape

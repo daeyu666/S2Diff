@@ -169,7 +169,8 @@ def run_train(cfg, train_loader, test_loader, info, device):
         warp_generator.manual_seed(warp_seed)
         print(
             "Training MSI misalignment augmentation: "
-            f"translation-only dx,dy~U(-{train_shift:g},{train_shift:g}) px, "
+            f"radial translation r~U(0,{train_shift:g}) px, theta~U(0,2pi), "
+            f"sqrt(dx^2+dy^2)<={train_shift:g}px, "
             f"probability={train_prob:.3f}, warp_seed={warp_seed}. "
             "GT/LR-HSI remain registered."
         )

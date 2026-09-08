@@ -69,8 +69,9 @@ class TrainConfig:
     # Legacy modes plus the new fully time-free Raw/HF x Direct/Gate grid.
     msi_ablation: str = "full"
 
-    # Baseline-2 non-registration augmentation. This intentionally perturbs
-    # only HR-MSI during training; GT/LR-HSI/Innovation-1 trajectory stay fixed.
+    # Baseline-2 non-registration augmentation. Only HR-MSI is perturbed;
+    # GT/LR-HSI/Innovation-1 trajectory stay fixed. IMPORTANT: d is the
+    # Euclidean translation-radius upper bound, sqrt(dx^2+dy^2)<=d.
     train_msi_translation_max_px: float = 0.0
     train_msi_translation_probability: float = 1.0
     train_misalignment_seed_offset: int = 7919
@@ -212,8 +213,9 @@ def parse_args(argv: Optional[List[str]] = None):
         type=float,
         default=0.0,
         help=(
-            "Baseline-2 training augmentation: dx,dy are sampled independently "
-            "from U(-d,d) and applied only to HR-MSI. 0 disables augmentation."
+            "Baseline-2 training augmentation: d is the maximum Euclidean 2-D "
+            "translation magnitude. r~U(0,d), theta~U(0,2pi), dx=r*cos(theta), "
+            "dy=r*sin(theta); only HR-MSI is warped. 0 disables augmentation."
         ),
     )
     parser.add_argument(
@@ -279,9 +281,6 @@ def parse_args(argv: Optional[List[str]] = None):
     if not 0.0 <= cfg.train_msi_translation_probability <= 1.0:
         raise ValueError("train_msi_translation_probability must lie in [0,1]")
 
-    # Innovation-2 ablations must never silently fall back to the HSI-only V1/V2
-    # predictor. This fail-fast guard prevents wasting long training runs when a
-    # CLI argument is dropped by a shell/IDE launch configuration.
     if cfg.msi_ablation in TIME_FREE_MSI_ABLATIONS and cfg.predictor_version != "v3":
         raise ValueError(
             "Innovation 2 ablation "
@@ -290,8 +289,6 @@ def parse_args(argv: Optional[List[str]] = None):
             "received by Python before starting training."
         )
 
-    # Baseline 2 is deliberately defined on the frozen Raw-Direct model so its
-    # gain measures data augmentation alone, without mixing in a new MSI module.
     if cfg.train_msi_translation_max_px > 0.0:
         if cfg.predictor_version != "v3" or cfg.msi_ablation != "raw_direct":
             raise ValueError(

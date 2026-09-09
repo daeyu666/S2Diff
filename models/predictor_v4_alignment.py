@@ -199,17 +199,26 @@ class DegradationDomainCoarseAligner:
         best_dy = torch.zeros(b, device=z_h.device, dtype=torch.long)
 
         radius = self.global_search_radius
-        for dy in range(-radius, radius + 1):
-            for dx in range(-radius, radius + 1):
-                shifted, valid = _integer_translate(z_m, dx, dy)
-                m_feat = _pixelwise_channel_normalize(shifted)
-                similarity = (h_feat * m_feat).sum(dim=1, keepdim=True)
-                denom = valid.sum(dim=(1, 2, 3)).clamp_min(1.0)
-                score = (similarity * valid).sum(dim=(1, 2, 3)) / denom
-                better = score > best_score
-                best_score = torch.where(better, score, best_score)
-                best_dx = torch.where(better, torch.full_like(best_dx, dx), best_dx)
-                best_dy = torch.where(better, torch.full_like(best_dy, dy), best_dy)
+        # Search zero displacement first and then increasing distance. Together
+        # with the strict improvement test this makes exact/near ties prefer the
+        # smaller displacement rather than an arbitrary window corner.
+        candidates = [
+            (dx, dy)
+            for dy in range(-radius, radius + 1)
+            for dx in range(-radius, radius + 1)
+        ]
+        candidates.sort(key=lambda p: (p[0] * p[0] + p[1] * p[1], abs(p[0]) + abs(p[1]), p[1], p[0]))
+
+        for dx, dy in candidates:
+            shifted, valid = _integer_translate(z_m, dx, dy)
+            m_feat = _pixelwise_channel_normalize(shifted)
+            similarity = (h_feat * m_feat).sum(dim=1, keepdim=True)
+            denom = valid.sum(dim=(1, 2, 3)).clamp_min(1.0)
+            score = (similarity * valid).sum(dim=(1, 2, 3)) / denom
+            better = score > (best_score + 1e-7)
+            best_score = torch.where(better, score, best_score)
+            best_dx = torch.where(better, torch.full_like(best_dx, dx), best_dx)
+            best_dy = torch.where(better, torch.full_like(best_dy, dy), best_dy)
 
         shifts = torch.stack([best_dx, best_dy], dim=1).to(hr_msi.dtype)
         zeros = torch.zeros(b, device=hr_msi.device, dtype=hr_msi.dtype)
@@ -236,7 +245,6 @@ class DegradationDomainCoarseAligner:
         scale = int(self.process.state(int(t)).scale)
         if scale in self.local_radius_by_scale:
             return self.local_radius_by_scale[scale]
-        # Fallback for future scale ratios: use the closest configured scale.
         nearest = min(self.local_radius_by_scale, key=lambda s: abs(s - scale))
         return self.local_radius_by_scale[nearest]
 
@@ -265,11 +273,17 @@ class DegradationDomainCoarseAligner:
         valid = valid.view(b, k, h, w) > 0.5
         score = score.masked_fill(~valid, -float("inf"))
 
-        best = score.argmax(dim=1)
         coord = torch.arange(-radius, radius + 1, device=z_h.device)
         dy_grid, dx_grid = torch.meshgrid(coord, coord, indexing="ij")
         dx_candidates = dx_grid.reshape(-1)
         dy_candidates = dy_grid.reshape(-1)
+        distance2 = (dx_candidates.square() + dy_candidates.square()).to(score.dtype)
+        # Only resolve numerical/flat-region ties. 1e-6 is tiny compared with
+        # cosine-score differences but ensures an ambiguous match prefers the
+        # smallest displacement, with zero selected for a fully flat window.
+        score = score - 1e-6 * distance2[None, :, None, None]
+
+        best = score.argmax(dim=1)
         dx = dx_candidates[best].to(z_h.dtype)
         dy = dy_candidates[best].to(z_h.dtype)
         return torch.stack([dx, dy], dim=1)

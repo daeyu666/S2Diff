@@ -1,8 +1,8 @@
 """Training and inference engine for the progressive degradation framework.
 
-V1/V2 predictors receive only (x_t, t). Innovation 2 V3 declares
-``requires_msi=True`` and receives (x_t, HR-MSI, t). The frozen degradation
-trajectory and reverse update remain identical across all predictor versions.
+V1/V2 predictors receive only (x_t, t). V3 receives (x_t, HR-MSI, t). V4 adds
+an explicit geometry-alignment front end while keeping the frozen Innovation-1
+physical trajectory and reverse update unchanged.
 """
 
 from __future__ import annotations
@@ -134,7 +134,7 @@ def model_predict(
     timesteps: torch.Tensor,
     hr_msi: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Dispatch V1/V2 single-modal or V3 MSI-guided predictor calls."""
+    """Dispatch HSI-only or MSI-guided predictor calls."""
     if bool(getattr(model, "requires_msi", False)):
         if hr_msi is None:
             raise ValueError("This predictor requires HR-MSI, but hr_msi is None")
@@ -152,12 +152,9 @@ def augment_training_msi_translation(
     """Apply translation-only MSI misalignment augmentation to a training batch.
 
     Only HR-MSI is changed. GT, LR-HSI and the progressive HSI state remain
-    untouched. IMPORTANT: ``max_shift_px=d`` is the maximum Euclidean 2-D
-    displacement. The shared sampler uses r~U(0,d), theta~U(0,2pi), then
-    dx=r*cos(theta), dy=r*sin(theta), so sqrt(dx^2+dy^2)<=d for every sample.
-    The returned scalar is the mean effective translation magnitude over the
-    whole batch and is logged so a misalignment run cannot silently fall back
-    to registered training.
+    untouched. ``max_shift_px=d`` is the maximum Euclidean 2-D displacement.
+    The shared sampler uses r~U(0,d), theta~U(0,2pi), then dx=r*cos(theta),
+    dy=r*sin(theta), so sqrt(dx^2+dy^2)<=d for every sample.
     """
     max_shift = float(max_shift_px)
     prob = float(probability)
@@ -195,6 +192,20 @@ def augment_training_msi_translation(
         hr_msi = warped
 
     return hr_msi, float(magnitude.mean().item())
+
+
+def _prepare_global_msi_for_training(
+    model: torch.nn.Module,
+    process: ProgressiveDegradation,
+    gt: torch.Tensor,
+    hr_msi: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """V4: estimate global coarse correction once per pair from the true x_T state."""
+    if hr_msi is None or not bool(getattr(model, "requires_global_msi_preparation", False)):
+        return hr_msi
+    with torch.no_grad():
+        reference = process.state_at(gt, process.total_steps)
+        return model.prepare_global_msi(reference, hr_msi, process.total_steps)
 
 
 def train_one_epoch(
@@ -237,6 +248,8 @@ def train_one_epoch(
                 generator=msi_misalignment_generator,
             )
             _ensure_finite("augmented_hr_msi", hr_msi)
+            hr_msi = _prepare_global_msi_for_training(model, process, gt, hr_msi)
+            _ensure_finite("globally_aligned_hr_msi", hr_msi)
         else:
             mean_shift = 0.0
 
@@ -312,6 +325,11 @@ def reconstruct_from_terminal_lr(
     """Run the fixed deterministic reverse recursion from an LR observation."""
     model.eval()
     x_t = process.terminal_state(lr_hsi, target_size=target_size)
+
+    # V4 global correction is intentionally estimated exactly once per pair,
+    # from the actual terminal reverse state. Every later t reuses this MSI.
+    if hr_msi is not None and bool(getattr(model, "requires_global_msi_preparation", False)):
+        hr_msi = model.prepare_global_msi(x_t, hr_msi, process.total_steps)
 
     for t in range(process.total_steps, 0, -1):
         timestep = torch.full(

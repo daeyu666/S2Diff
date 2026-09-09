@@ -1,9 +1,8 @@
 """S2Diff training / evaluation entry point.
 
-V1 and V2 are HSI-only predictors used to validate Innovation 1. V3 is the
-Innovation 2 predictor. V3 ablation modes change only the MSI guidance path
-while keeping the same backbone, progressive physical degradation, losses and
-reverse update.
+V1/V2 are HSI-only predictors. V3 contains the MSI ablation family. V4 is the
+first explicit non-registration model: global coarse correction + degradation-
+domain matching + local coarse correspondence, followed by Raw-Direct fusion.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ from models import (
     CleanHSIPredictor,
     MSIAblationGuidedPredictor,
     SpectralSpatialCleanHSIPredictor,
+    StateMatchedCoarseAlignedPredictor,
 )
 from utils import (
     CSVLogger,
@@ -36,6 +36,17 @@ def _compact_float_tag(value: float) -> str:
     return text.replace("-", "m").replace(".", "p")
 
 
+def _augmentation_tag(cfg) -> str:
+    train_shift = float(getattr(cfg, "train_msi_translation_max_px", 0.0))
+    train_prob = float(getattr(cfg, "train_msi_translation_probability", 1.0))
+    if train_shift <= 0.0:
+        return ""
+    tag = f"_traug{_compact_float_tag(train_shift)}"
+    if abs(train_prob - 1.0) > 1e-12:
+        tag += f"_p{_compact_float_tag(train_prob)}"
+    return tag
+
+
 def _predictor_tag(cfg):
     version = str(getattr(cfg, "predictor_version", "v1")).lower()
     base_channels = int(cfg.predictor_base_channels)
@@ -47,14 +58,10 @@ def _predictor_tag(cfg):
         ablation = str(getattr(cfg, "msi_ablation", "full")).lower()
         mode_tag = "" if ablation == "full" else f"_{ablation}"
         width_tag = "" if base_channels == 64 else f"_bc{base_channels}"
-        train_shift = float(getattr(cfg, "train_msi_translation_max_px", 0.0))
-        train_prob = float(getattr(cfg, "train_msi_translation_probability", 1.0))
-        aug_tag = ""
-        if train_shift > 0.0:
-            aug_tag = f"_traug{_compact_float_tag(train_shift)}"
-            if abs(train_prob - 1.0) > 1e-12:
-                aug_tag += f"_p{_compact_float_tag(train_prob)}"
-        return f"_v3{mode_tag}{width_tag}{aug_tag}"
+        return f"_v3{mode_tag}{width_tag}{_augmentation_tag(cfg)}"
+    if version == "v4":
+        width_tag = "" if base_channels == 64 else f"_bc{base_channels}"
+        return f"_v4_align3{width_tag}{_augmentation_tag(cfg)}"
     raise ValueError(f"Unsupported predictor_version: {version}")
 
 
@@ -78,7 +85,7 @@ def _checkpoint_paths(cfg):
     return best_path, last_path
 
 
-def _build_model(cfg, info, device):
+def _build_model(cfg, info, device, process=None):
     common = dict(
         n_bands=int(info["n_bands"]),
         total_steps=int(cfg.diffusion_steps),
@@ -105,17 +112,47 @@ def _build_model(cfg, info, device):
             msi_highpass_sigma=float(getattr(cfg, "msi_highpass_sigma", 1.0)),
             msi_ablation=str(getattr(cfg, "msi_ablation", "full")),
         )
+    elif version == "v4":
+        if process is None:
+            raise ValueError("V4 requires the Innovation-1 progressive process")
+        if info.get("srf_weights") is None:
+            raise ValueError("V4 requires fixed SRF weights; use --msi_mode srf")
+        model = StateMatchedCoarseAlignedPredictor(
+            **common,
+            n_msi_bands=int(info["n_select_bands"]),
+            spectral_hidden=int(getattr(cfg, "spectral_stem_hidden", 8)),
+            msi_highpass_kernel=int(getattr(cfg, "msi_highpass_kernel", 5)),
+            msi_highpass_sigma=float(getattr(cfg, "msi_highpass_sigma", 1.0)),
+            progressive_process=process,
+            srf_weights=torch.as_tensor(info["srf_weights"], dtype=torch.float32),
+            alignment_global_search_radius=int(cfg.alignment_global_search_radius),
+            alignment_local_radius_scale1=int(cfg.alignment_local_radius_scale1),
+            alignment_local_radius_scale2=int(cfg.alignment_local_radius_scale2),
+            alignment_local_radius_scale4=int(cfg.alignment_local_radius_scale4),
+        )
     else:
         raise ValueError(f"Unsupported predictor_version: {version}")
 
     model = model.to(device)
-    ablation = str(getattr(cfg, "msi_ablation", "full")) if version == "v3" else "n/a"
+    ablation = (
+        "raw_direct(aligned)" if version == "v4"
+        else str(getattr(cfg, "msi_ablation", "full")) if version == "v3"
+        else "n/a"
+    )
     print(
-        f"Predictor version={version}, msi_ablation={ablation}, "
+        f"Predictor version={version}, msi_mode={ablation}, "
         f"base_channels={cfg.predictor_base_channels}, "
         f"requires_msi={bool(getattr(model, 'requires_msi', False))}, "
         f"trainable params={count_parameters(model):.3f} M"
     )
+    if version == "v4":
+        print(
+            "V4 alignment: global_radius="
+            f"{cfg.alignment_global_search_radius}, local_radius(scale1/2/4)="
+            f"{cfg.alignment_local_radius_scale1}/"
+            f"{cfg.alignment_local_radius_scale2}/"
+            f"{cfg.alignment_local_radius_scale4}"
+        )
     return model
 
 
@@ -131,7 +168,7 @@ def _format_metrics(metrics):
 
 def run_train(cfg, train_loader, test_loader, info, device):
     process = build_progressive_process(cfg)
-    model = _build_model(cfg, info, device)
+    model = _build_model(cfg, info, device, process=process)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
@@ -170,7 +207,6 @@ def run_train(cfg, train_loader, test_loader, info, device):
         print(
             "Training MSI misalignment augmentation: "
             f"radial translation r~U(0,{train_shift:g}) px, theta~U(0,2pi), "
-            f"sqrt(dx^2+dy^2)<={train_shift:g}px, "
             f"probability={train_prob:.3f}, warp_seed={warp_seed}. "
             "GT/LR-HSI remain registered."
         )
@@ -275,7 +311,7 @@ def run_train(cfg, train_loader, test_loader, info, device):
 
 def run_test(cfg, test_loader, info, device):
     process = build_progressive_process(cfg)
-    model = _build_model(cfg, info, device)
+    model = _build_model(cfg, info, device, process=process)
     best_path, _ = _checkpoint_paths(cfg)
     checkpoint = cfg.resume or best_path
 

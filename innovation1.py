@@ -1,8 +1,8 @@
 """Training and inference engine for the progressive degradation framework.
 
 V1/V2 predictors receive only (x_t, t). V3 receives (x_t, HR-MSI, t). V4 adds
-an explicit geometry-alignment front end while keeping the frozen Innovation-1
-physical trajectory and reverse update unchanged.
+learnable global rigid correction and scale-progressive local alignment while
+keeping the frozen Innovation-1 physical trajectory and reverse update intact.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ class Innovation1TrainStats:
     sam: float
     deg: float
     msi_shift: float = 0.0
+    msi_rotation: float = 0.0
 
 
 def build_progressive_process(cfg) -> ProgressiveDegradation:
@@ -142,37 +143,42 @@ def model_predict(
     return model(x_t, timesteps)
 
 
-def augment_training_msi_translation(
+def augment_training_msi_global(
     hr_msi: torch.Tensor,
     *,
     max_shift_px: float,
+    max_rotation_deg: float = 0.0,
     probability: float = 1.0,
     generator: Optional[torch.Generator] = None,
-) -> Tuple[torch.Tensor, float]:
-    """Apply translation-only MSI misalignment augmentation to a training batch.
+) -> Tuple[torch.Tensor, float, float]:
+    """Apply synthetic global MSI misalignment during training.
 
-    Only HR-MSI is changed. GT, LR-HSI and the progressive HSI state remain
-    untouched. ``max_shift_px=d`` is the maximum Euclidean 2-D displacement.
-    The shared sampler uses r~U(0,d), theta~U(0,2pi), then dx=r*cos(theta),
-    dy=r*sin(theta), so sqrt(dx^2+dy^2)<=d for every sample.
+    Only HR-MSI is changed. GT, LR-HSI and the physical HSI trajectory remain
+    fixed. Translation uses the shared radial sampler and rotation is sampled
+    uniformly by ``make_misaligned_msi``. Returned scalars are mean effective
+    translation magnitude and mean absolute rotation over the batch.
     """
     max_shift = float(max_shift_px)
+    max_rotation = float(max_rotation_deg)
     prob = float(probability)
     if max_shift < 0.0:
         raise ValueError("max_shift_px must be >= 0")
+    if max_rotation < 0.0:
+        raise ValueError("max_rotation_deg must be >= 0")
     if not 0.0 <= prob <= 1.0:
         raise ValueError("probability must lie in [0,1]")
-    if max_shift == 0.0 or prob == 0.0:
-        return hr_msi, 0.0
+    if (max_shift == 0.0 and max_rotation == 0.0) or prob == 0.0:
+        return hr_msi, 0.0, 0.0
 
     warped, _, params = make_misaligned_msi(
         hr_msi,
         translation_max_px=max_shift,
-        rotation_max_deg=0.0,
+        rotation_max_deg=max_rotation,
         local_max_displacement_px=0.0,
         generator=generator,
     )
     magnitude = torch.sqrt(params.dx_px.square() + params.dy_px.square())
+    abs_rotation = params.rotation_deg.abs()
 
     if prob < 1.0:
         use_aug = torch.rand(
@@ -187,25 +193,50 @@ def augment_training_msi_translation(
             warped,
             hr_msi,
         )
-        magnitude = magnitude * use_aug_device.to(dtype=magnitude.dtype)
+        use_float = use_aug_device.to(dtype=magnitude.dtype)
+        magnitude = magnitude * use_float
+        abs_rotation = abs_rotation * use_float
     else:
         hr_msi = warped
 
-    return hr_msi, float(magnitude.mean().item())
+    return (
+        hr_msi,
+        float(magnitude.mean().item()),
+        float(abs_rotation.mean().item()),
+    )
 
 
-def _prepare_global_msi_for_training(
+def augment_training_msi_translation(
+    hr_msi: torch.Tensor,
+    *,
+    max_shift_px: float,
+    probability: float = 1.0,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, float]:
+    """Backward-compatible translation-only wrapper used by existing tests."""
+    out, mean_shift, _ = augment_training_msi_global(
+        hr_msi,
+        max_shift_px=max_shift_px,
+        max_rotation_deg=0.0,
+        probability=probability,
+        generator=generator,
+    )
+    return out, mean_shift
+
+
+def _prepare_alignment_for_training(
     model: torch.nn.Module,
     process: ProgressiveDegradation,
     gt: torch.Tensor,
     hr_msi: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    """V4: estimate global coarse correction once per pair from the true x_T state."""
-    if hr_msi is None or not bool(getattr(model, "requires_global_msi_preparation", False)):
-        return hr_msi
-    with torch.no_grad():
-        reference = process.state_at(gt, process.total_steps)
-        return model.prepare_global_msi(reference, hr_msi, process.total_steps)
+    """Prepare V4 geometry once per pair while preserving alignment gradients."""
+    del process
+    if hr_msi is None:
+        return None
+    if bool(getattr(model, "supports_training_alignment_pyramid", False)):
+        return model.prepare_training_alignment(gt, hr_msi)
+    return hr_msi
 
 
 def train_one_epoch(
@@ -222,6 +253,7 @@ def train_one_epoch(
     boundary_radius: int = 1,
     grad_clip: float = 1.0,
     msi_translation_max_px: float = 0.0,
+    msi_rotation_max_deg: float = 0.0,
     msi_translation_probability: float = 1.0,
     msi_misalignment_generator: Optional[torch.Generator] = None,
 ) -> Innovation1TrainStats:
@@ -234,28 +266,37 @@ def train_one_epoch(
     sam_meter = AverageMeter()
     deg_meter = AverageMeter()
     shift_meter = AverageMeter()
+    rotation_meter = AverageMeter()
 
     for batch in loader:
         gt = batch["gt"].to(device, non_blocking=True)
+        batch_size = gt.shape[0]
+        _ensure_finite("gt", gt)
+
         hr_msi = None
+        mean_shift = 0.0
+        mean_rotation = 0.0
         if bool(getattr(model, "requires_msi", False)):
             hr_msi = batch["hr_msi"].to(device, non_blocking=True)
             _ensure_finite("hr_msi", hr_msi)
-            hr_msi, mean_shift = augment_training_msi_translation(
+            hr_msi, mean_shift, mean_rotation = augment_training_msi_global(
                 hr_msi,
                 max_shift_px=msi_translation_max_px,
+                max_rotation_deg=msi_rotation_max_deg,
                 probability=msi_translation_probability,
                 generator=msi_misalignment_generator,
             )
             _ensure_finite("augmented_hr_msi", hr_msi)
-            hr_msi = _prepare_global_msi_for_training(model, process, gt, hr_msi)
-            _ensure_finite("globally_aligned_hr_msi", hr_msi)
-        else:
-            mean_shift = 0.0
+            hr_msi = _prepare_alignment_for_training(
+                model,
+                process,
+                gt,
+                hr_msi,
+            )
+            _ensure_finite("prepared_hr_msi", hr_msi)
 
-        batch_size = gt.shape[0]
         shift_meter.update(mean_shift, batch_size)
-        _ensure_finite("gt", gt)
+        rotation_meter.update(mean_rotation, batch_size)
 
         timesteps = process.sample_timesteps(
             batch_size,
@@ -310,6 +351,7 @@ def train_one_epoch(
         sam=sam_meter.avg,
         deg=deg_meter.avg,
         msi_shift=shift_meter.avg,
+        msi_rotation=rotation_meter.avg,
     )
 
 
@@ -326,10 +368,16 @@ def reconstruct_from_terminal_lr(
     model.eval()
     x_t = process.terminal_state(lr_hsi, target_size=target_size)
 
-    # V4 global correction is intentionally estimated exactly once per pair,
-    # from the actual terminal reverse state. Every later t reuses this MSI.
-    if hr_msi is not None and bool(getattr(model, "requires_global_msi_preparation", False)):
-        hr_msi = model.prepare_global_msi(x_t, hr_msi, process.total_steps)
+    # V4 global rigid correction is predicted exactly once. Its local field is
+    # then updated only when t enters a new physical scale (4 -> 2 -> 1).
+    if hr_msi is not None and bool(
+        getattr(model, "requires_global_msi_preparation", False)
+    ):
+        hr_msi = model.prepare_global_msi(
+            x_t,
+            hr_msi,
+            process.total_steps,
+        )
 
     for t in range(process.total_steps, 0, -1):
         timestep = torch.full(

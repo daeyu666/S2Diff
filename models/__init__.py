@@ -8,8 +8,11 @@ from .predictor_v3_ablation import (
     VALID_MSI_ABLATIONS,
 )
 from .predictor_v4_alignment import (
+    AlignmentDescriptor,
     CoarseAlignmentDiagnostics,
     DegradationDomainCoarseAligner,
+    LearnedGlobalRigidAligner,
+    SparseProgressiveLocalAligner,
     StateMatchedCoarseAlignedPredictor,
     spectral_project_hsi,
 )
@@ -20,8 +23,11 @@ __all__ = [
     "MSIHighFrequencyGuidedPredictor",
     "MSIAblationGuidedPredictor",
     "VALID_MSI_ABLATIONS",
+    "AlignmentDescriptor",
     "CoarseAlignmentDiagnostics",
     "DegradationDomainCoarseAligner",
+    "LearnedGlobalRigidAligner",
+    "SparseProgressiveLocalAligner",
     "StateMatchedCoarseAlignedPredictor",
     "spectral_project_hsi",
 ]

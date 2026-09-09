@@ -48,53 +48,168 @@ except ImportError:
     h5py = None
 
 
+def _extract_3d_numeric_array(value):
+    """Recursively unwrap common MATLAB containers and return a 3-D array."""
+    if isinstance(value, dict):
+        for nested in value.values():
+            found = _extract_3d_numeric_array(nested)
+            if found is not None:
+                return found
+        return None
+
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            found = _extract_3d_numeric_array(nested)
+            if found is not None:
+                return found
+        return None
+
+    if not isinstance(value, np.ndarray):
+        return None
+
+    arr = value
+
+    # MATLAB structs/cells are often represented as a singleton object array.
+    visited = 0
+    while isinstance(arr, np.ndarray) and arr.dtype == object and arr.size == 1 and visited < 8:
+        arr = np.asarray(arr.reshape(-1)[0])
+        visited += 1
+
+    # Structured arrays may contain the actual cube in one field.
+    if isinstance(arr, np.ndarray) and arr.dtype.names:
+        for field in arr.dtype.names:
+            found = _extract_3d_numeric_array(arr[field])
+            if found is not None:
+                return found
+        return None
+
+    if not isinstance(arr, np.ndarray):
+        return None
+
+    arr = np.squeeze(arr)
+    if arr.ndim == 3 and np.issubdtype(arr.dtype, np.number):
+        return arr
+
+    if arr.dtype == object:
+        for nested in arr.reshape(-1):
+            found = _extract_3d_numeric_array(nested)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_cube_in_mapping(mapping, candidate_keys: List[str]):
+    for key in candidate_keys:
+        if key in mapping:
+            found = _extract_3d_numeric_array(mapping[key])
+            if found is not None:
+                return found, key
+
+    for key, value in mapping.items():
+        if str(key).startswith("__"):
+            continue
+        found = _extract_3d_numeric_array(value)
+        if found is not None:
+            return found, str(key)
+    return None, None
+
+
+def _mapping_summary(mapping) -> str:
+    items = []
+    for key, value in mapping.items():
+        if str(key).startswith("__"):
+            continue
+        shape = getattr(value, "shape", None)
+        dtype = getattr(value, "dtype", None)
+        items.append(f"{key}:shape={shape},dtype={dtype},type={type(value).__name__}")
+    return "; ".join(items[:20]) or "<no non-metadata keys>"
+
+
 def read_hsi_mat(file_path: str, candidate_keys: List[str]) -> np.ndarray:
-    """
-    读取.mat格式高光谱数据，返回H×W×C格式。
-    优先按candidate_keys读取，读取失败时自动寻找第一个三维数组。
+    """Read a MATLAB HSI cube and return HxWxC.
+
+    Each available backend is tried independently. A backend that can open the
+    file but cannot expose a usable 3-D array no longer prevents later backends
+    from being attempted. This matters for some MATLAB v7/v7.3 files whose
+    representation differs between hdf5storage, scipy.io and h5py.
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Cannot find data file: {file_path}")
 
-    mat_data = None
+    diagnostics = []
 
     if hdf5storage is not None:
         try:
             mat_data = hdf5storage.loadmat(file_path)
-        except Exception:
-            mat_data = None
+            img, key = _find_cube_in_mapping(mat_data, candidate_keys)
+            if img is not None:
+                print(f"MAT reader: hdf5storage key={key}, raw_shape={img.shape}")
+                return fix_hsi_shape(img)
+            diagnostics.append(
+                "hdf5storage opened file but found no 3-D cube; " + _mapping_summary(mat_data)
+            )
+        except Exception as exc:
+            diagnostics.append(f"hdf5storage failed: {type(exc).__name__}: {exc}")
 
-    if mat_data is None and scio is not None:
+    if scio is not None:
         try:
             mat_data = scio.loadmat(file_path)
-        except Exception:
-            mat_data = None
-
-    if mat_data is not None:
-        for key in candidate_keys:
-            if key in mat_data and isinstance(mat_data[key], np.ndarray):
-                img = mat_data[key]
+            img, key = _find_cube_in_mapping(mat_data, candidate_keys)
+            if img is not None:
+                print(f"MAT reader: scipy.io key={key}, raw_shape={img.shape}")
                 return fix_hsi_shape(img)
-
-        for key, value in mat_data.items():
-            if key.startswith("__"):
-                continue
-            if isinstance(value, np.ndarray) and value.ndim == 3:
-                return fix_hsi_shape(value)
+            diagnostics.append(
+                "scipy.io opened file but found no 3-D cube; " + _mapping_summary(mat_data)
+            )
+        except Exception as exc:
+            diagnostics.append(f"scipy.io failed: {type(exc).__name__}: {exc}")
 
     if h5py is not None:
-        with h5py.File(file_path, "r") as f:
-            for key in candidate_keys:
-                if key in f:
-                    img = np.array(f[key])
-                    return fix_hsi_shape(img)
+        try:
+            with h5py.File(file_path, "r") as f:
+                # Prefer exact top-level candidate keys.
+                for key in candidate_keys:
+                    if key in f and isinstance(f[key], h5py.Dataset):
+                        arr = np.array(f[key])
+                        arr = np.squeeze(arr)
+                        if arr.ndim == 3 and np.issubdtype(arr.dtype, np.number):
+                            print(f"MAT reader: h5py key={key}, raw_shape={arr.shape}")
+                            return fix_hsi_shape(arr)
 
-            for key in f.keys():
-                value = np.array(f[key])
-                if value.ndim == 3:
-                    return fix_hsi_shape(value)
+                found = []
 
-    raise RuntimeError(f"No valid 3D HSI array found in {file_path}")
+                def visitor(name, obj):
+                    if found or not isinstance(obj, h5py.Dataset):
+                        return
+                    try:
+                        shape = tuple(obj.shape)
+                        if len(shape) == 3 and np.issubdtype(obj.dtype, np.number):
+                            found.append((name, np.array(obj)))
+                    except Exception:
+                        return
+
+                f.visititems(visitor)
+                if found:
+                    name, arr = found[0]
+                    print(f"MAT reader: h5py dataset={name}, raw_shape={arr.shape}")
+                    return fix_hsi_shape(arr)
+
+                top = []
+                for key in f.keys():
+                    obj = f[key]
+                    top.append(
+                        f"{key}:type={type(obj).__name__},shape={getattr(obj, 'shape', None)}"
+                    )
+                diagnostics.append(
+                    "h5py opened file but found no numeric 3-D dataset; " + "; ".join(top[:20])
+                )
+        except Exception as exc:
+            diagnostics.append(f"h5py failed: {type(exc).__name__}: {exc}")
+
+    detail = "\n  - ".join(diagnostics) if diagnostics else "no MAT backend is installed"
+    raise RuntimeError(
+        f"No valid 3D HSI array found in {file_path}. Backend diagnostics:\n  - {detail}"
+    )
 
 
 def fix_hsi_shape(img: np.ndarray) -> np.ndarray:

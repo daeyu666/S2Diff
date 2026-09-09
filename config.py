@@ -1,4 +1,3 @@
-# config.py
 import argparse
 import os
 from dataclasses import dataclass, field
@@ -39,7 +38,6 @@ class TrainConfig:
     scale_ratio: int = 4
     n_select_bands: int = 4
 
-    # Fixed sensor protocols: PaviaU->IKONOS4; Houston13/Chikusei->WV2 all8.
     msi_mode: str = "srf"
     srf_path: str = ""
     wavelength_root: str = "./data/wavelengths"
@@ -57,8 +55,6 @@ class TrainConfig:
     boundary_probability: float = 0.2
     boundary_radius: int = 1
 
-    # v1: plain HSI U-Net; v2: spectral-spatial HSI-only;
-    # v3: MSI ablation family; v4: first three explicit alignment steps.
     predictor_version: str = "v1"
     predictor_base_channels: int = 64
     predictor_time_dim: int = 256
@@ -68,17 +64,21 @@ class TrainConfig:
     msi_highpass_sigma: float = 1.0
     msi_ablation: str = "full"
 
-    # Innovation-2 v4 alignment. Global correction is one integer translation
-    # per pair. Local search radii are tied to Innovation-1 effective scale.
+    # Innovation-2 V4: learnable global rigid + sparse progressive local alignment.
+    alignment_descriptor_channels: int = 32
     alignment_global_search_radius: int = 6
+    alignment_global_rotation_max_deg: float = 3.0
+    alignment_global_rotation_step_deg: float = 1.0
+    alignment_global_feature_downsample: int = 4
+    alignment_global_candidate_chunk: int = 64
+    alignment_control_stride: int = 4
     alignment_local_radius_scale1: int = 1
     alignment_local_radius_scale2: int = 2
     alignment_local_radius_scale4: int = 3
 
-    # Non-registration augmentation. Only HR-MSI is perturbed; GT/LR-HSI and
-    # the Innovation-1 trajectory stay fixed. d is the Euclidean translation
-    # radius upper bound, sqrt(dx^2+dy^2)<=d.
+    # Synthetic global non-registration augmentation. Only HR-MSI is perturbed.
     train_msi_translation_max_px: float = 0.0
+    train_msi_rotation_max_deg: float = 0.0
     train_msi_translation_probability: float = 1.0
     train_misalignment_seed_offset: int = 7919
 
@@ -104,6 +104,7 @@ class TrainConfig:
     save_interval: int = 20
     eval_interval: int = 1
     resume: str = ""
+    init_checkpoint: str = ""
     save_name: str = ""
 
     datasets: dict = field(default_factory=dict)
@@ -184,7 +185,10 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--boundary_radius", type=int, default=1)
 
     parser.add_argument(
-        "--predictor_version", type=str, default="v1", choices=["v1", "v2", "v3", "v4"]
+        "--predictor_version",
+        type=str,
+        default="v1",
+        choices=["v1", "v2", "v3", "v4"],
     )
     parser.add_argument("--predictor_base_channels", type=int, default=64)
     parser.add_argument("--predictor_time_dim", type=int, default=256)
@@ -208,11 +212,18 @@ def parse_args(argv: Optional[List[str]] = None):
             "hf_gate",
         ],
         help=(
-            "V3 ablation selector. V4 uses the Raw-Direct backbone internally; "
-            "pass --msi_ablation raw_direct for explicit experiment logging."
+            "V3 ablation selector. V4 uses Raw-Direct internally; pass "
+            "--msi_ablation raw_direct for explicit experiment logging."
         ),
     )
+
+    parser.add_argument("--alignment_descriptor_channels", type=int, default=32)
     parser.add_argument("--alignment_global_search_radius", type=int, default=6)
+    parser.add_argument("--alignment_global_rotation_max_deg", type=float, default=3.0)
+    parser.add_argument("--alignment_global_rotation_step_deg", type=float, default=1.0)
+    parser.add_argument("--alignment_global_feature_downsample", type=int, default=4)
+    parser.add_argument("--alignment_global_candidate_chunk", type=int, default=64)
+    parser.add_argument("--alignment_control_stride", type=int, default=4)
     parser.add_argument("--alignment_local_radius_scale1", type=int, default=1)
     parser.add_argument("--alignment_local_radius_scale2", type=int, default=2)
     parser.add_argument("--alignment_local_radius_scale4", type=int, default=3)
@@ -222,15 +233,21 @@ def parse_args(argv: Optional[List[str]] = None):
         type=float,
         default=0.0,
         help=(
-            "Training MSI translation radius d. r~U(0,d), theta~U(0,2pi); "
-            "only HR-MSI is warped. 0 disables augmentation."
+            "Training MSI translation radius d. Only HR-MSI is warped. "
+            "0 disables translation augmentation."
         ),
+    )
+    parser.add_argument(
+        "--train_msi_rotation_max_deg",
+        type=float,
+        default=0.0,
+        help="Training MSI global rotation bound in degrees; 0 disables rotation.",
     )
     parser.add_argument(
         "--train_msi_translation_probability",
         type=float,
         default=1.0,
-        help="Per-sample probability of applying training MSI translation.",
+        help="Per-sample probability of applying the global MSI warp.",
     )
     parser.add_argument(
         "--train_misalignment_seed_offset",
@@ -261,6 +278,16 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--save_interval", type=int, default=20)
     parser.add_argument("--eval_interval", type=int, default=1)
     parser.add_argument("--resume", type=str, default="")
+    parser.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default="",
+        help=(
+            "Optional weights-only warm start. For V4 this can point to the "
+            "registered V3 Raw-Direct checkpoint; new alignment parameters "
+            "remain freshly initialized."
+        ),
+    )
     parser.add_argument("--save_name", type=str, default="")
 
     args = parser.parse_args(argv)
@@ -284,12 +311,28 @@ def parse_args(argv: Optional[List[str]] = None):
         raise ValueError("msi_highpass_kernel must be odd and >= 3")
     if cfg.msi_highpass_sigma <= 0.0:
         raise ValueError("msi_highpass_sigma must be > 0")
+
     if cfg.train_msi_translation_max_px < 0.0:
         raise ValueError("train_msi_translation_max_px must be >= 0")
+    if cfg.train_msi_rotation_max_deg < 0.0:
+        raise ValueError("train_msi_rotation_max_deg must be >= 0")
     if not 0.0 <= cfg.train_msi_translation_probability <= 1.0:
         raise ValueError("train_msi_translation_probability must lie in [0,1]")
+
+    if cfg.alignment_descriptor_channels < 4:
+        raise ValueError("alignment_descriptor_channels must be >= 4")
     if cfg.alignment_global_search_radius < 0:
         raise ValueError("alignment_global_search_radius must be >= 0")
+    if cfg.alignment_global_rotation_max_deg < 0.0:
+        raise ValueError("alignment_global_rotation_max_deg must be >= 0")
+    if cfg.alignment_global_rotation_step_deg <= 0.0:
+        raise ValueError("alignment_global_rotation_step_deg must be > 0")
+    if cfg.alignment_global_feature_downsample < 1:
+        raise ValueError("alignment_global_feature_downsample must be >= 1")
+    if cfg.alignment_global_candidate_chunk < 1:
+        raise ValueError("alignment_global_candidate_chunk must be >= 1")
+    if cfg.alignment_control_stride < 2:
+        raise ValueError("alignment_control_stride must be >= 2")
     if min(
         cfg.alignment_local_radius_scale1,
         cfg.alignment_local_radius_scale2,
@@ -297,27 +340,37 @@ def parse_args(argv: Optional[List[str]] = None):
     ) < 0:
         raise ValueError("alignment local radii must be >= 0")
 
-    if cfg.msi_ablation in TIME_FREE_MSI_ABLATIONS and cfg.predictor_version not in ("v3", "v4"):
+    if cfg.msi_ablation in TIME_FREE_MSI_ABLATIONS and cfg.predictor_version not in (
+        "v3",
+        "v4",
+    ):
         raise ValueError(
             f"MSI mode {cfg.msi_ablation!r} requires predictor v3 or v4."
         )
     if cfg.predictor_version == "v4" and cfg.msi_ablation != "raw_direct":
         raise ValueError(
-            "V4 is defined on the Raw-Direct fusion backbone; use --msi_ablation raw_direct."
+            "V4 is defined on the Raw-Direct fusion backbone; use "
+            "--msi_ablation raw_direct."
         )
 
-    if cfg.train_msi_translation_max_px > 0.0:
+    if (
+        cfg.train_msi_translation_max_px > 0.0
+        or cfg.train_msi_rotation_max_deg > 0.0
+    ):
         valid_misaligned_training = (
             (cfg.predictor_version == "v3" and cfg.msi_ablation == "raw_direct")
             or cfg.predictor_version == "v4"
         )
         if not valid_misaligned_training:
             raise ValueError(
-                "MSI translation training is supported for V3 Raw-Direct baseline or V4 alignment."
+                "MSI global-warp training is supported for V3 Raw-Direct "
+                "baseline or V4 alignment."
             )
 
     if cfg.predictor_version == "v4" and cfg.msi_mode != "srf":
         raise ValueError("V4 state-matched alignment requires --msi_mode srf")
+    if cfg.resume and cfg.init_checkpoint:
+        raise ValueError("Use either --resume or --init_checkpoint, not both")
 
     make_dirs(cfg)
     return cfg

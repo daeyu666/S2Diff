@@ -1,8 +1,9 @@
 """S2Diff training / evaluation entry point.
 
 V1/V2 are HSI-only predictors. V3 contains the MSI ablation family. V4 is the
-first explicit non-registration model: global coarse correction + degradation-
-domain matching + local coarse correspondence, followed by Raw-Direct fusion.
+learnable non-registration model: one global rigid correction + frozen
+physical-domain matching + sparse progressive local residual alignment,
+followed by the Raw-Direct fusion backbone.
 """
 
 from __future__ import annotations
@@ -37,13 +38,21 @@ def _compact_float_tag(value: float) -> str:
 
 
 def _augmentation_tag(cfg) -> str:
-    train_shift = float(getattr(cfg, "train_msi_translation_max_px", 0.0))
-    train_prob = float(getattr(cfg, "train_msi_translation_probability", 1.0))
-    if train_shift <= 0.0:
+    shift = float(getattr(cfg, "train_msi_translation_max_px", 0.0))
+    rotation = float(getattr(cfg, "train_msi_rotation_max_deg", 0.0))
+    probability = float(
+        getattr(cfg, "train_msi_translation_probability", 1.0)
+    )
+    pieces = []
+    if shift > 0.0:
+        pieces.append(f"traug{_compact_float_tag(shift)}")
+    if rotation > 0.0:
+        pieces.append(f"rotaug{_compact_float_tag(rotation)}")
+    if not pieces:
         return ""
-    tag = f"_traug{_compact_float_tag(train_shift)}"
-    if abs(train_prob - 1.0) > 1e-12:
-        tag += f"_p{_compact_float_tag(train_prob)}"
+    tag = "_" + "_".join(pieces)
+    if abs(probability - 1.0) > 1e-12:
+        tag += f"_p{_compact_float_tag(probability)}"
     return tag
 
 
@@ -61,7 +70,7 @@ def _predictor_tag(cfg):
         return f"_v3{mode_tag}{width_tag}{_augmentation_tag(cfg)}"
     if version == "v4":
         width_tag = "" if base_channels == 64 else f"_bc{base_channels}"
-        return f"_v4_align3{width_tag}{_augmentation_tag(cfg)}"
+        return f"_v4_learnalign3{width_tag}{_augmentation_tag(cfg)}"
     raise ValueError(f"Unsupported predictor_version: {version}")
 
 
@@ -125,7 +134,21 @@ def _build_model(cfg, info, device, process=None):
             msi_highpass_sigma=float(getattr(cfg, "msi_highpass_sigma", 1.0)),
             progressive_process=process,
             srf_weights=torch.as_tensor(info["srf_weights"], dtype=torch.float32),
+            alignment_descriptor_channels=int(cfg.alignment_descriptor_channels),
             alignment_global_search_radius=int(cfg.alignment_global_search_radius),
+            alignment_global_rotation_max_deg=float(
+                cfg.alignment_global_rotation_max_deg
+            ),
+            alignment_global_rotation_step_deg=float(
+                cfg.alignment_global_rotation_step_deg
+            ),
+            alignment_global_feature_downsample=int(
+                cfg.alignment_global_feature_downsample
+            ),
+            alignment_global_candidate_chunk=int(
+                cfg.alignment_global_candidate_chunk
+            ),
+            alignment_control_stride=int(cfg.alignment_control_stride),
             alignment_local_radius_scale1=int(cfg.alignment_local_radius_scale1),
             alignment_local_radius_scale2=int(cfg.alignment_local_radius_scale2),
             alignment_local_radius_scale4=int(cfg.alignment_local_radius_scale4),
@@ -135,8 +158,10 @@ def _build_model(cfg, info, device, process=None):
 
     model = model.to(device)
     ablation = (
-        "raw_direct(aligned)" if version == "v4"
-        else str(getattr(cfg, "msi_ablation", "full")) if version == "v3"
+        "raw_direct(learned-aligned)"
+        if version == "v4"
+        else str(getattr(cfg, "msi_ablation", "full"))
+        if version == "v3"
         else "n/a"
     )
     print(
@@ -147,8 +172,12 @@ def _build_model(cfg, info, device, process=None):
     )
     if version == "v4":
         print(
-            "V4 alignment: global_radius="
-            f"{cfg.alignment_global_search_radius}, local_radius(scale1/2/4)="
+            "V4 learned alignment: descriptor="
+            f"{cfg.alignment_descriptor_channels}, global translation radius="
+            f"{cfg.alignment_global_search_radius}px, rotation="
+            f"±{cfg.alignment_global_rotation_max_deg:g}deg/"
+            f"{cfg.alignment_global_rotation_step_deg:g}deg, control_stride="
+            f"{cfg.alignment_control_stride}, local radius(scale1/2/4)="
             f"{cfg.alignment_local_radius_scale1}/"
             f"{cfg.alignment_local_radius_scale2}/"
             f"{cfg.alignment_local_radius_scale4}"
@@ -158,8 +187,14 @@ def _build_model(cfg, info, device, process=None):
 
 def _format_metrics(metrics):
     keys = [
-        "PSNR", "SAM", "RMSE", "ERGAS", "SSIM", "CC",
-        "INIT_PSNR", "INIT_SAM",
+        "PSNR",
+        "SAM",
+        "RMSE",
+        "ERGAS",
+        "SSIM",
+        "CC",
+        "INIT_PSNR",
+        "INIT_SAM",
     ]
     return " ".join(
         f"{key}={metrics[key]:.6f}" for key in keys if key in metrics
@@ -169,6 +204,23 @@ def _format_metrics(metrics):
 def run_train(cfg, train_loader, test_loader, info, device):
     process = build_progressive_process(cfg)
     model = _build_model(cfg, info, device, process=process)
+
+    if cfg.init_checkpoint:
+        loaded_epoch, loaded_best = load_checkpoint(
+            model,
+            cfg.init_checkpoint,
+            optimizer=None,
+            strict=False,
+            map_location=str(device),
+            load_optimizer=False,
+        )
+        print(
+            f"Warm-started weights from {cfg.init_checkpoint}: "
+            f"source_epoch={loaded_epoch}, source_best={loaded_best:.6f}. "
+            "Training still starts from epoch 1; new V4 alignment parameters "
+            "remain freshly initialized."
+        )
+
     optimizer = torch.optim.Adam(
         model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
     )
@@ -179,7 +231,10 @@ def run_train(cfg, train_loader, test_loader, info, device):
 
     if cfg.resume:
         loaded_epoch, loaded_best = load_checkpoint(
-            model, cfg.resume, optimizer=optimizer, map_location=str(device)
+            model,
+            cfg.resume,
+            optimizer=optimizer,
+            map_location=str(device),
         )
         start_epoch = int(loaded_epoch) + 1
         best_psnr = float(loaded_best)
@@ -198,17 +253,20 @@ def run_train(cfg, train_loader, test_loader, info, device):
         print(f"Degradation operator: {process.operator.extra_repr()}")
 
     train_shift = float(getattr(cfg, "train_msi_translation_max_px", 0.0))
+    train_rotation = float(getattr(cfg, "train_msi_rotation_max_deg", 0.0))
     train_prob = float(getattr(cfg, "train_msi_translation_probability", 1.0))
     warp_generator = None
-    if train_shift > 0.0:
-        warp_seed = int(cfg.seed) + int(getattr(cfg, "train_misalignment_seed_offset", 7919))
+    if train_shift > 0.0 or train_rotation > 0.0:
+        warp_seed = int(cfg.seed) + int(
+            getattr(cfg, "train_misalignment_seed_offset", 7919)
+        )
         warp_generator = torch.Generator(device="cpu")
         warp_generator.manual_seed(warp_seed)
         print(
-            "Training MSI misalignment augmentation: "
-            f"radial translation r~U(0,{train_shift:g}) px, theta~U(0,2pi), "
-            f"probability={train_prob:.3f}, warp_seed={warp_seed}. "
-            "GT/LR-HSI remain registered."
+            "Training MSI global misalignment augmentation: "
+            f"translation_radius<={train_shift:g}px, "
+            f"rotation<=±{train_rotation:g}deg, probability={train_prob:.3f}, "
+            f"warp_seed={warp_seed}. GT/LR-HSI remain registered."
         )
 
     log_path = os.path.join(
@@ -219,9 +277,22 @@ def run_train(cfg, train_loader, test_loader, info, device):
     logger = CSVLogger(
         log_path,
         fieldnames=[
-            "epoch", "loss", "l1", "sam_loss", "deg_loss", "msi_shift_px",
-            "PSNR", "SAM", "RMSE", "ERGAS", "SSIM", "CC",
-            "INIT_PSNR", "INIT_SAM", "best_PSNR",
+            "epoch",
+            "loss",
+            "l1",
+            "sam_loss",
+            "deg_loss",
+            "msi_shift_px",
+            "msi_rotation_deg",
+            "PSNR",
+            "SAM",
+            "RMSE",
+            "ERGAS",
+            "SSIM",
+            "CC",
+            "INIT_PSNR",
+            "INIT_SAM",
+            "best_PSNR",
         ],
     )
 
@@ -239,6 +310,7 @@ def run_train(cfg, train_loader, test_loader, info, device):
             boundary_radius=cfg.boundary_radius,
             grad_clip=cfg.grad_clip,
             msi_translation_max_px=train_shift,
+            msi_rotation_max_deg=train_rotation,
             msi_translation_probability=train_prob,
             msi_misalignment_generator=warp_generator,
         )
@@ -247,15 +319,20 @@ def run_train(cfg, train_loader, test_loader, info, device):
             f"Epoch {epoch:04d}/{cfg.epochs:04d} "
             f"loss={stats.loss:.6f} l1={stats.l1:.6f} "
             f"sam={stats.sam:.6f} deg={stats.deg:.6f} "
-            f"msi_shift={stats.msi_shift:.4f}px"
+            f"msi_shift={stats.msi_shift:.4f}px "
+            f"msi_rot={stats.msi_rotation:.4f}deg"
         )
 
         metrics = {}
         if epoch % cfg.eval_interval == 0 or epoch == cfg.epochs:
             metrics = evaluate(
-                model, test_loader, process, device, scale_ratio=cfg.scale_ratio
+                model,
+                test_loader,
+                process,
+                device,
+                scale_ratio=cfg.scale_ratio,
             )
-            if train_shift > 0.0:
+            if train_shift > 0.0 or train_rotation > 0.0:
                 print(f"  registered eval: {_format_metrics(metrics)}")
             else:
                 print(f"  eval: {_format_metrics(metrics)}")
@@ -281,6 +358,7 @@ def run_train(cfg, train_loader, test_loader, info, device):
                 "sam_loss": stats.sam,
                 "deg_loss": stats.deg,
                 "msi_shift_px": stats.msi_shift,
+                "msi_rotation_deg": stats.msi_rotation,
                 "PSNR": metrics.get("PSNR", ""),
                 "SAM": metrics.get("SAM", ""),
                 "RMSE": metrics.get("RMSE", ""),

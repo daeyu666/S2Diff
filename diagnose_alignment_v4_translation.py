@@ -1,11 +1,13 @@
-"""Translation diagnosis for Innovation-2 V4 coarse alignment.
+"""Translation diagnosis for learned Innovation-2 V4 alignment.
 
 The external misalignment protocol is identical to the Raw-Direct sensitivity
-experiment. Only HR-MSI is warped. V4 then performs:
-  global coarse correction -> degradation-domain local matching -> coarse Raw
-  MSI resampling -> Raw-Direct fusion.
+experiment. Only HR-MSI is warped. V4 performs one learned global rigid
+correction, physical-domain matching, and sparse local residual updates only at
+the scale-4/2/1 boundaries before Raw-Direct fusion.
 
-Valid-overlap PSNR/SAM remain the primary metrics.
+Valid-overlap PSNR/SAM remain the primary metrics. This script expects a trained
+V4 checkpoint; a V3 Raw-Direct checkpoint is only a warm-start source for V4
+training and is not a complete V4 evaluation checkpoint.
 """
 
 from __future__ import annotations
@@ -77,7 +79,7 @@ def run(cfg, diagnostic):
     model = _build_model(cfg, info, device, process=process)
 
     if not cfg.resume:
-        raise ValueError("Pass a V4 or compatible Raw-Direct checkpoint with --resume")
+        raise ValueError("Pass the trained V4 checkpoint explicitly with --resume")
     loaded_epoch, loaded_best = load_checkpoint(
         model,
         cfg.resume,
@@ -86,7 +88,7 @@ def run(cfg, diagnostic):
         load_optimizer=False,
     )
     print(
-        f"Loaded checkpoint {cfg.resume}: epoch={loaded_epoch}, "
+        f"Loaded trained V4 checkpoint {cfg.resume}: epoch={loaded_epoch}, "
         f"stored_best_PSNR={loaded_best:.6f}"
     )
 
@@ -144,13 +146,21 @@ def run(cfg, diagnostic):
                 else:
                     gx = float(global_shift[0, 0].item())
                     gy = float(global_shift[0, 1].item())
+                global_rotation = model.last_global_rotation_deg
+                grot = (
+                    float("nan")
+                    if global_rotation is None
+                    else float(global_rotation[0].item())
+                )
 
                 local_mean = float("nan")
+                local_scale = -1
                 if model.last_alignment is not None:
                     local_mag = torch.linalg.vector_norm(
                         model.last_alignment.local_offset_px.float(), dim=1
                     )
                     local_mean = float(local_mag.mean().item())
+                    local_scale = int(model.last_alignment.local_scale)
 
                 details.append(
                     {
@@ -162,7 +172,9 @@ def run(cfg, diagnostic):
                         "actual_shift_px": math.hypot(dx, dy),
                         "global_correction_dx_px": gx,
                         "global_correction_dy_px": gy,
-                        "final_t_local_offset_mean_px": local_mean,
+                        "global_correction_rotation_deg": grot,
+                        "final_local_scale": local_scale,
+                        "final_local_offset_mean_px": local_mean,
                         "valid_fraction": valid_fraction,
                         "PSNR_full": full["PSNR"],
                         "SAM_full": full["SAM"],
@@ -195,13 +207,16 @@ def run(cfg, diagnostic):
                         for r in rows
                     ])
                 ),
-                "mean_final_t_local_offset_px": float(
-                    np.mean([r["final_t_local_offset_mean_px"] for r in rows])
+                "mean_abs_global_rotation_deg": float(
+                    np.mean([abs(r["global_correction_rotation_deg"]) for r in rows])
+                ),
+                "mean_final_local_offset_px": float(
+                    np.mean([r["final_local_offset_mean_px"] for r in rows])
                 ),
             }
         )
 
-    print("\nV4 translation alignment summary (valid-overlap primary):")
+    print("\nLearned V4 translation alignment summary (valid-overlap primary):")
     for row in summary:
         print(
             f"d={row['max_shift_px']:>4.1f}px "
@@ -209,7 +224,8 @@ def run(cfg, diagnostic):
             f"PSNR_valid={row['PSNR_valid']:.4f} "
             f"SAM_valid={row['SAM_valid']:.4f} "
             f"global_corr={row['mean_global_correction_px']:.3f}px "
-            f"local@t1={row['mean_final_t_local_offset_px']:.3f}px"
+            f"global_rot={row['mean_abs_global_rotation_deg']:.3f}deg "
+            f"local_final={row['mean_final_local_offset_px']:.3f}px"
         )
 
     if diagnostic.misalignment_output:
@@ -218,7 +234,7 @@ def run(cfg, diagnostic):
         summary_path = os.path.join(
             cfg.output_root,
             "metrics",
-            f"{cfg.dataset}_v4_alignment_translation.csv",
+            f"{cfg.dataset}_v4_learned_alignment_translation.csv",
         )
     stem, ext = os.path.splitext(summary_path)
     detail_path = f"{stem}_details{ext or '.csv'}"

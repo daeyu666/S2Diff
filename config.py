@@ -58,7 +58,7 @@ class TrainConfig:
     boundary_radius: int = 1
 
     # v1: plain HSI U-Net; v2: spectral-spatial HSI-only;
-    # v3: Innovation 2 MSI-guided predictor.
+    # v3: MSI ablation family; v4: first three explicit alignment steps.
     predictor_version: str = "v1"
     predictor_base_channels: int = 64
     predictor_time_dim: int = 256
@@ -66,12 +66,18 @@ class TrainConfig:
     spectral_stem_hidden: int = 8
     msi_highpass_kernel: int = 5
     msi_highpass_sigma: float = 1.0
-    # Legacy modes plus the new fully time-free Raw/HF x Direct/Gate grid.
     msi_ablation: str = "full"
 
-    # Baseline-2 non-registration augmentation. Only HR-MSI is perturbed;
-    # GT/LR-HSI/Innovation-1 trajectory stay fixed. IMPORTANT: d is the
-    # Euclidean translation-radius upper bound, sqrt(dx^2+dy^2)<=d.
+    # Innovation-2 v4 alignment. Global correction is one integer translation
+    # per pair. Local search radii are tied to Innovation-1 effective scale.
+    alignment_global_search_radius: int = 6
+    alignment_local_radius_scale1: int = 1
+    alignment_local_radius_scale2: int = 2
+    alignment_local_radius_scale4: int = 3
+
+    # Non-registration augmentation. Only HR-MSI is perturbed; GT/LR-HSI and
+    # the Innovation-1 trajectory stay fixed. d is the Euclidean translation
+    # radius upper bound, sqrt(dx^2+dy^2)<=d.
     train_msi_translation_max_px: float = 0.0
     train_msi_translation_probability: float = 1.0
     train_misalignment_seed_offset: int = 7919
@@ -178,7 +184,7 @@ def parse_args(argv: Optional[List[str]] = None):
     parser.add_argument("--boundary_radius", type=int, default=1)
 
     parser.add_argument(
-        "--predictor_version", type=str, default="v1", choices=["v1", "v2", "v3"]
+        "--predictor_version", type=str, default="v1", choices=["v1", "v2", "v3", "v4"]
     )
     parser.add_argument("--predictor_base_channels", type=int, default=64)
     parser.add_argument("--predictor_time_dim", type=int, default=256)
@@ -202,20 +208,22 @@ def parse_args(argv: Optional[List[str]] = None):
             "hf_gate",
         ],
         help=(
-            "Legacy: no_msi/full/raw_msi/hf_nogate/hf_const. "
-            "Time-free orthogonal grid: raw_direct/raw_gate/hf_direct/hf_gate; "
-            "the new grid uses alpha=1 and removes timestep conditioning from "
-            "the MSI transfer gate."
+            "V3 ablation selector. V4 uses the Raw-Direct backbone internally; "
+            "pass --msi_ablation raw_direct for explicit experiment logging."
         ),
     )
+    parser.add_argument("--alignment_global_search_radius", type=int, default=6)
+    parser.add_argument("--alignment_local_radius_scale1", type=int, default=1)
+    parser.add_argument("--alignment_local_radius_scale2", type=int, default=2)
+    parser.add_argument("--alignment_local_radius_scale4", type=int, default=3)
+
     parser.add_argument(
         "--train_msi_translation_max_px",
         type=float,
         default=0.0,
         help=(
-            "Baseline-2 training augmentation: d is the maximum Euclidean 2-D "
-            "translation magnitude. r~U(0,d), theta~U(0,2pi), dx=r*cos(theta), "
-            "dy=r*sin(theta); only HR-MSI is warped. 0 disables augmentation."
+            "Training MSI translation radius d. r~U(0,d), theta~U(0,2pi); "
+            "only HR-MSI is warped. 0 disables augmentation."
         ),
     )
     parser.add_argument(
@@ -280,21 +288,36 @@ def parse_args(argv: Optional[List[str]] = None):
         raise ValueError("train_msi_translation_max_px must be >= 0")
     if not 0.0 <= cfg.train_msi_translation_probability <= 1.0:
         raise ValueError("train_msi_translation_probability must lie in [0,1]")
+    if cfg.alignment_global_search_radius < 0:
+        raise ValueError("alignment_global_search_radius must be >= 0")
+    if min(
+        cfg.alignment_local_radius_scale1,
+        cfg.alignment_local_radius_scale2,
+        cfg.alignment_local_radius_scale4,
+    ) < 0:
+        raise ValueError("alignment local radii must be >= 0")
 
-    if cfg.msi_ablation in TIME_FREE_MSI_ABLATIONS and cfg.predictor_version != "v3":
+    if cfg.msi_ablation in TIME_FREE_MSI_ABLATIONS and cfg.predictor_version not in ("v3", "v4"):
         raise ValueError(
-            "Innovation 2 ablation "
-            f"{cfg.msi_ablation!r} requires --predictor_version v3, but parsed "
-            f"predictor_version={cfg.predictor_version!r}. Check the actual command "
-            "received by Python before starting training."
+            f"MSI mode {cfg.msi_ablation!r} requires predictor v3 or v4."
+        )
+    if cfg.predictor_version == "v4" and cfg.msi_ablation != "raw_direct":
+        raise ValueError(
+            "V4 is defined on the Raw-Direct fusion backbone; use --msi_ablation raw_direct."
         )
 
     if cfg.train_msi_translation_max_px > 0.0:
-        if cfg.predictor_version != "v3" or cfg.msi_ablation != "raw_direct":
+        valid_misaligned_training = (
+            (cfg.predictor_version == "v3" and cfg.msi_ablation == "raw_direct")
+            or cfg.predictor_version == "v4"
+        )
+        if not valid_misaligned_training:
             raise ValueError(
-                "Training MSI translation augmentation is the Raw-Direct Baseline 2; "
-                "use --predictor_version v3 --msi_ablation raw_direct."
+                "MSI translation training is supported for V3 Raw-Direct baseline or V4 alignment."
             )
+
+    if cfg.predictor_version == "v4" and cfg.msi_mode != "srf":
+        raise ValueError("V4 state-matched alignment requires --msi_mode srf")
 
     make_dirs(cfg)
     return cfg

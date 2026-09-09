@@ -1,10 +1,9 @@
 import torch
-import torch.nn.functional as F
 
 from degradations import BicubicDegradation, ProgressiveDegradation
-from degradations.misalignment import build_global_grid
 from models.predictor_v4_alignment import (
     DegradationDomainCoarseAligner,
+    SparseProgressiveLocalAligner,
     StateMatchedCoarseAlignedPredictor,
     spectral_project_hsi,
 )
@@ -18,25 +17,11 @@ def _scale1_process():
     )
 
 
-def _forward_translate(x, dx, dy):
-    b = x.shape[0]
-    zeros = torch.zeros(b, dtype=x.dtype, device=x.device)
-    grid = build_global_grid(
-        b,
-        x.shape[-2],
-        x.shape[-1],
-        torch.full((b,), float(dx), dtype=x.dtype, device=x.device),
-        torch.full((b,), float(dy), dtype=x.dtype, device=x.device),
-        zeros,
-        device=x.device,
-        dtype=x.dtype,
-    )
-    return F.grid_sample(
-        x,
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=False,
+def _scale4_process():
+    return ProgressiveDegradation(
+        BicubicDegradation(scale_ratio=4),
+        total_steps=12,
+        default_lift_mode="bilinear",
     )
 
 
@@ -55,31 +40,28 @@ def test_spectral_projection_applies_fixed_srf():
     assert torch.allclose(out, expected)
 
 
-def test_global_coarse_correction_recovers_integer_translation():
-    torch.manual_seed(3)
+def test_v4_alignment_frontend_has_trainable_geometry_parameters():
     process = _scale1_process()
-    srf = torch.eye(3)
     aligner = DegradationDomainCoarseAligner(
         process,
-        srf,
-        global_search_radius=3,
+        torch.eye(3),
+        n_msi_bands=3,
+        descriptor_channels=8,
+        global_search_radius=1,
+        global_rotation_max_deg=1.0,
+        global_rotation_step_deg=1.0,
+        global_feature_downsample=2,
+        global_candidate_chunk=8,
+        control_stride=4,
         local_radius_scale1=1,
         local_radius_scale2=1,
         local_radius_scale4=1,
     )
-
-    reference = torch.rand(1, 3, 24, 24)
-    misaligned = _forward_translate(reference, dx=2, dy=-1)
-    corrected, shift = aligner.global_coarse_correction(
-        reference,
-        misaligned,
-        reference_t=1,
-    )
-
-    # MSI content was moved right by +2 and up by -1. Correction must apply
-    # the inverse content translation: left 2 and down 1.
-    assert tuple(shift[0].round().to(torch.int64).tolist()) == (-2, 1)
-    assert torch.mean(torch.abs(corrected[..., 3:-3, 3:-3] - reference[..., 3:-3, 3:-3])) < 1e-5
+    names = [name for name, p in aligner.named_parameters() if p.requires_grad]
+    assert any("global_aligner.descriptor" in name for name in names)
+    assert any("local_aligner.descriptor" in name for name in names)
+    assert any("global_aligner.log_temperature" in name for name in names)
+    assert any("local_aligner.log_temperature" in name for name in names)
 
 
 def test_matched_states_remove_spectral_and_spatial_operator_difference():
@@ -92,7 +74,14 @@ def test_matched_states_remove_spectral_and_spatial_operator_difference():
         ],
         dtype=torch.float32,
     )
-    aligner = DegradationDomainCoarseAligner(process, srf)
+    aligner = DegradationDomainCoarseAligner(
+        process,
+        srf,
+        n_msi_bands=2,
+        descriptor_channels=8,
+        global_search_radius=0,
+        global_rotation_max_deg=0.0,
+    )
     hsi = torch.rand(2, 3, 16, 16)
     msi = spectral_project_hsi(hsi, srf)
     t = torch.ones(2, dtype=torch.long)
@@ -102,41 +91,37 @@ def test_matched_states_remove_spectral_and_spatial_operator_difference():
     assert torch.allclose(z_h, z_m, atol=1e-6, rtol=1e-6)
 
 
-def test_local_candidate_search_outputs_source_offset_toward_best_msi_match():
+def test_sparse_local_search_is_differentiable_and_outputs_smooth_dense_field():
     torch.manual_seed(5)
-    process = _scale1_process()
-    srf = torch.eye(3)
-    aligner = DegradationDomainCoarseAligner(
-        process,
-        srf,
-        global_search_radius=0,
-        local_radius_scale1=2,
-        local_radius_scale2=2,
-        local_radius_scale4=2,
+    local = SparseProgressiveLocalAligner(
+        n_msi_bands=3,
+        descriptor_channels=8,
+        control_stride=4,
+        radius_by_scale={1: 1, 2: 1, 4: 1},
     )
+    z_h = torch.rand(2, 3, 20, 20)
+    z_m = torch.rand(2, 3, 20, 20)
+    dense, control = local(z_h, z_m, None, scale=4)
 
-    z_h = torch.rand(1, 3, 20, 20)
-    # Move MSI content right by one pixel. For HSI location p, the matching MSI
-    # source location is therefore q=p+(+1,0).
-    z_m = _forward_translate(z_h, dx=1, dy=0)
-    offset = aligner.local_coarse_correspondence(
-        z_h,
-        z_m,
-        torch.ones(1, dtype=torch.long),
-    )
+    assert dense.shape == (2, 2, 20, 20)
+    assert control.shape[-2] < dense.shape[-2]
+    assert control.shape[-1] < dense.shape[-1]
 
-    interior = offset[0, :, 3:-3, 3:-3]
-    assert torch.mean((interior[0] == 1).float()) > 0.99
-    assert torch.mean((interior[1] == 0).float()) > 0.99
+    loss = dense.square().mean()
+    loss.backward()
+    grad = local.descriptor.net[0].weight.grad
+    assert grad is not None
+    assert torch.isfinite(grad).all()
+    assert float(grad.abs().sum()) > 0.0
 
 
-def test_v4_forward_keeps_raw_direct_zero_head_initialization():
+def test_v4_inference_updates_local_field_only_at_scale_boundaries():
     torch.manual_seed(6)
-    process = _scale1_process()
+    process = _scale4_process()
     model = StateMatchedCoarseAlignedPredictor(
         n_bands=3,
         n_msi_bands=3,
-        total_steps=1,
+        total_steps=12,
         base_channels=8,
         time_dim=32,
         dropout=0.0,
@@ -144,17 +129,34 @@ def test_v4_forward_keeps_raw_direct_zero_head_initialization():
         spectral_hidden=4,
         progressive_process=process,
         srf_weights=torch.eye(3),
-        alignment_global_search_radius=1,
+        alignment_descriptor_channels=8,
+        alignment_global_search_radius=0,
+        alignment_global_rotation_max_deg=0.0,
+        alignment_global_feature_downsample=2,
+        alignment_control_stride=4,
         alignment_local_radius_scale1=1,
         alignment_local_radius_scale2=1,
         alignment_local_radius_scale4=1,
     )
-    x_t = torch.rand(1, 3, 16, 16)
-    msi = x_t.clone()
-    prepared = model.prepare_global_msi(x_t, msi, reference_t=1)
-    out = model(x_t, prepared, torch.ones(1, dtype=torch.long))
+    model.eval()
+    gt = torch.rand(1, 3, 16, 16)
+    msi = gt.clone()
+    x12 = process.state_at(gt, 12)
+    prepared = model.prepare_global_msi(x12, msi, reference_t=12)
 
-    assert out.shape == x_t.shape
-    assert torch.allclose(out, x_t, atol=1e-6, rtol=1e-6)
-    assert model.last_alignment is not None
-    assert model.last_alignment.local_offset_px.shape == (1, 2, 16, 16)
+    ids = []
+    scales = []
+    with torch.no_grad():
+        for t in [12, 11, 8, 7, 4, 3]:
+            x_t = process.state_at(gt, t)
+            out = model(x_t, prepared, torch.tensor([t]))
+            assert out.shape == x_t.shape
+            ids.append(id(model._inference_local_offset))
+            scales.append(model._inference_local_scale)
+
+    assert scales == [4, 4, 2, 2, 1, 1]
+    assert ids[0] == ids[1]
+    assert ids[2] == ids[3]
+    assert ids[4] == ids[5]
+    assert ids[0] != ids[2]
+    assert ids[2] != ids[4]

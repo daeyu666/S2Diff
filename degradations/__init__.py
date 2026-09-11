@@ -7,6 +7,13 @@ from typing import Any
 from .base import BaseDegradation
 from .bicubic import BicubicDegradation
 from .gaussian_bicubic import GaussianBicubicDegradation
+from .inverse_flow import (
+    forward_to_inverse_sampling_field,
+    inverse_field_diagnostics,
+    inverse_fixed_point_residual,
+    positive_offset_grid,
+    sample_with_positive_offset,
+)
 from .misalignment import (
     MisalignmentParameters,
     apply_misalignment,
@@ -59,8 +66,13 @@ __all__ = [
     "build_degradation",
     "build_global_grid",
     "build_local_grid",
+    "forward_to_inverse_sampling_field",
     "generate_smooth_local_displacement",
+    "inverse_field_diagnostics",
+    "inverse_fixed_point_residual",
     "make_misaligned_msi",
+    "positive_offset_grid",
     "sample_misalignment_parameters",
+    "sample_with_positive_offset",
     "sigma_from_mtf_nyquist",
 ]

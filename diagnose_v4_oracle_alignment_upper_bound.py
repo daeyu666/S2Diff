@@ -9,10 +9,11 @@ Raw-Direct reconstruction backbone:
 3. learned_alignment: current recurrent 4->2->1 local alignment;
 4. oracle_inverse: warped HR-MSI resampled with the exact inverse sampling field.
 
-Misaligned/learned/oracle metrics use the same validity mask.  Pristine is
-reported both on the full image and on that common mask.  The script also
-reports MSI-domain residual error after learned/oracle realignment and an
-oracle-gap recovery ratio:
+Misaligned/learned/oracle metrics use one strict common-overlap mask formed by
+intersecting the forward-warp validity, oracle-resampling validity and learned-
+resampling validity.  Pristine is reported both on the full image and on that
+same common mask.  The script also reports MSI-domain residual error after
+learned/oracle realignment and an oracle-gap recovery ratio:
 
     recovery = (PSNR_learned - PSNR_noalign)
                / (PSNR_oracle - PSNR_noalign)
@@ -113,6 +114,7 @@ def evaluate_upper_bound(
             "learned_psnr": [], "learned_sam": [],
             "oracle_psnr": [], "oracle_sam": [],
             "oracle_msi_l1": [], "learned_msi_l1": [],
+            "common_valid_fraction": [],
         }
 
         for trial in range(int(trials)):
@@ -161,21 +163,32 @@ def evaluate_upper_bound(
                     warped_msi=warped,
                 )
 
+                learned_flow = model._inference_local_offset
+                if learned_flow is None:
+                    raise RuntimeError("learned alignment did not produce final local flow")
+                learned_aligned_msi = _sample_with_source_offset(warped, learned_flow)
+
+                # Second resampling introduces its own border invalidity.  Use
+                # the exact same strict overlap for registered/no-align/learned/oracle.
+                oracle_valid = _sample_with_source_offset(valid, inverse).clamp(0.0, 1.0)
+                learned_valid = _sample_with_source_offset(valid, learned_flow).clamp(0.0, 1.0)
+                common_valid = torch.minimum(valid, torch.minimum(oracle_valid, learned_valid))
+
                 ones = torch.ones_like(valid)
                 reg_full_psnr, reg_full_sam, _ = calc_masked_psnr_sam(
                     registered_pred, gt, ones, threshold=0.5
                 )
                 reg_common_psnr, reg_common_sam, _ = calc_masked_psnr_sam(
-                    registered_pred, gt, valid, threshold=float(valid_threshold)
+                    registered_pred, gt, common_valid, threshold=float(valid_threshold)
                 )
                 noalign_psnr, noalign_sam, _ = calc_masked_psnr_sam(
-                    noalign_pred, gt, valid, threshold=float(valid_threshold)
+                    noalign_pred, gt, common_valid, threshold=float(valid_threshold)
                 )
                 learned_psnr, learned_sam, _ = calc_masked_psnr_sam(
-                    learned_pred, gt, valid, threshold=float(valid_threshold)
+                    learned_pred, gt, common_valid, threshold=float(valid_threshold)
                 )
                 oracle_psnr, oracle_sam, _ = calc_masked_psnr_sam(
-                    oracle_pred, gt, valid, threshold=float(valid_threshold)
+                    oracle_pred, gt, common_valid, threshold=float(valid_threshold)
                 )
 
                 values = {
@@ -190,17 +203,15 @@ def evaluate_upper_bound(
                     "oracle_psnr": oracle_psnr,
                     "oracle_sam": oracle_sam,
                     "oracle_msi_l1": _masked_l1(
-                        oracle_aligned_msi, hr_msi, valid, float(valid_threshold)
+                        oracle_aligned_msi, hr_msi, common_valid, float(valid_threshold)
+                    ),
+                    "learned_msi_l1": _masked_l1(
+                        learned_aligned_msi, hr_msi, common_valid, float(valid_threshold)
+                    ),
+                    "common_valid_fraction": float(
+                        (common_valid >= float(valid_threshold)).float().mean().item()
                     ),
                 }
-
-                learned_flow = model._inference_local_offset
-                if learned_flow is None:
-                    raise RuntimeError("learned alignment did not produce final local flow")
-                learned_aligned_msi = _sample_with_source_offset(warped, learned_flow)
-                values["learned_msi_l1"] = _masked_l1(
-                    learned_aligned_msi, hr_msi, valid, float(valid_threshold)
-                )
 
                 for key, value in values.items():
                     accum[key].append(float(value))
@@ -321,7 +332,8 @@ def main():
             f"oracle_gain={result['oracle_gain_db']:+.3f}dB "
             f"oracle-learned={result['oracle_gap_db']:+.3f}dB "
             f"registered-oracle={result['registered_gap_db']:+.3f}dB "
-            f"recovery={recovery_text}"
+            f"recovery={recovery_text} "
+            f"common_valid={100.0 * result['common_valid_fraction']:.1f}%"
         )
 
 

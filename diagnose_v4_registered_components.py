@@ -45,9 +45,7 @@ def reconstruct_no_alignment(model, process, lr_hsi, *, target_size, hr_msi):
         timestep = torch.full(
             (x_t.shape[0],), int(t), dtype=torch.long, device=x_t.device
         )
-        pred_x0 = MSIAblationGuidedPredictor.forward(
-            model, x_t, hr_msi, timestep
-        )
+        pred_x0 = MSIAblationGuidedPredictor.forward(model, x_t, hr_msi, timestep)
         x_t = process.reverse_update(x_t, pred_x0, int(t))
     return x_t
 
@@ -68,9 +66,7 @@ def reconstruct_global_only(model, process, lr_hsi, *, target_size, hr_msi):
         timestep = torch.full(
             (x_t.shape[0],), int(t), dtype=torch.long, device=x_t.device
         )
-        pred_x0 = MSIAblationGuidedPredictor.forward(
-            model, x_t, aligned, timestep
-        )
+        pred_x0 = MSIAblationGuidedPredictor.forward(model, x_t, aligned, timestep)
         x_t = process.reverse_update(x_t, pred_x0, int(t))
     return x_t
 
@@ -96,6 +92,17 @@ def _mean_global_rotation(model) -> float:
     return float(rotation.detach().float().abs().mean().item())
 
 
+def _set_recurrent_defaults(cfg) -> None:
+    cfg.recurrent_hidden_channels = 64
+    cfg.recurrent_correlation_channels = 32
+    cfg.recurrent_iterations_scale1 = 2
+    cfg.recurrent_iterations_scale2 = 2
+    cfg.recurrent_iterations_scale4 = 3
+    cfg.recurrent_max_update_scale1 = 0.5
+    cfg.recurrent_max_update_scale2 = 1.0
+    cfg.recurrent_max_update_scale4 = 2.0
+
+
 def parse_joint_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
@@ -110,6 +117,7 @@ def parse_joint_args():
         raise ValueError("registered component audit is test-only; use --stage test")
     if str(cfg.predictor_version).lower() != "v4":
         raise ValueError("registered component audit requires predictor_version=v4")
+    _set_recurrent_defaults(cfg)
     return cfg, joint
 
 
